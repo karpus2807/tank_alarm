@@ -3,132 +3,81 @@
 #include <SPI.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <WebServer.h>
+#include <BLEDevice.h>
 #include <Wire.h>
 #include <Ethernet.h>
 #include <EthernetUdp.h>
 #include <U8g2lib.h>
-#include <utility/w5100.h>
-#include "soc/soc.h"
-#include "soc/rtc_cntl_reg.h"
 #include <Preferences.h>
 #include "config.h"
-#include "link_mode.h"
-#include "wifi_store.h"
+#include "app_config.h"
+#include "ble_name.h"
 
-// 1.3" 128x64, text upright. Most 1.3" modules are SH1106.
 U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+WebServer server(HTTP_PORT);
 EthernetUDP UdpEth;
 WiFiUDP UdpWifi;
+EthernetServer ethHttp(HTTP_PORT);
 
-static const bool THIS_IS_TANK = false;
-
-static const float ALARM_PUSH_PERCENT = 95.0f;
-static const uint32_t CONNECTED_SPLASH_MS = 1800;
-
-enum UiMode : uint8_t {
-  UI_BOOT = 0,
-  UI_WAITING,
-  UI_CONNECTED_SPLASH,
-  UI_LIVE,
-  UI_DISCONNECTED,
-};
+static Cfg cfg;
+static Cfg remote;
+static bool ethReady = false;
+static bool ethHw = false;
+static bool wifiUdp = false;
+static bool staUp = false;
+static uint32_t dhcpStart = 0;
+static uint32_t dhcpTry = 0;
+static uint32_t staTry = 0;
+static uint32_t rebootAt = 0;
+static bool muted = false;
+static bool everConnected = false;
+static char ipBuf[16];
+static char modeIpBuf[16];
 
 struct TankStatus {
   float pct = NAN;
   float cm = NAN;
-  uint8_t alarm = ALARM_LEVEL_NONE;
-  bool ok = false;
   bool level = false;
+  bool fresh = true;
   uint32_t lastRx = 0;
 };
-
 static TankStatus tank;
-static bool ethUdpReady = false;
-static bool wifiUdpReady = false;
-static bool ethHwReady = false;
-static bool wantHome = false;
-static bool appliedHome = false;
-static uint32_t dhcpStartMs = 0;
-static uint32_t dhcpTryAt = 0;
-static uint32_t wifiBeginAt = 0;
-static uint32_t wifiDownSince = 0;
-static bool reenterMode = false;
-static WlanCreds wlan{};
-static char consoleLine[128];
-static uint8_t consoleLen = 0;
-static bool muted = false;
-static bool peerLocked = false;
-static bool everConnected = false;
-static char myMacHex[13];
-static UiMode uiMode = UI_BOOT;
-static uint32_t connectedSplashUntil = 0;
-static bool wasLive = false;
 
-static uint8_t readPhy() {
-  SPI.beginTransaction(SPI_ETHERNET_SETTINGS);
-  uint8_t v = W5100.readPHYCFGR_W5500();
-  SPI.endTransaction();
-  return v;
+static void ipToBuf(const IPAddress& ip, char* out, size_t n) {
+  snprintf(out, n, "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
 }
 
-static void drawTurned(const char* msg, const uint8_t* font, int xRight, int yTop) {
-  u8g2.setFont(font);
-  u8g2.setFontDirection(1);
-  u8g2.drawStr(xRight, yTop, msg);
-  u8g2.setFontDirection(0);
-}
-
-static void drawBootLogo() {
-  u8g2.clearBuffer();
-  const int cx = 30;
-  const int cy = 30;
-  u8g2.drawTriangle(cx, cy - 16, cx - 12, cy + 2, cx + 12, cy + 2);
-  u8g2.drawDisc(cx, cy + 8, 12);
-  u8g2.setDrawColor(0);
-  u8g2.drawDisc(cx - 4, cy + 5, 2);
-  u8g2.setDrawColor(1);
-  drawTurned("TANK", u8g2_font_7x13B_tf, 78, 16);
-  drawTurned("ALARM", u8g2_font_6x12_tf, 108, 14);
-  u8g2.sendBuffer();
-}
-
-static void drawStatusScreen(const char* word, bool blinkBorder) {
-  const int W = u8g2.getDisplayWidth();
-  const int H = u8g2.getDisplayHeight();
-  u8g2.clearBuffer();
-  if (!blinkBorder || ((millis() / 400) & 1)) {
-    u8g2.drawFrame(1, 1, W - 2, H - 2);
+static void chosenIps() {
+  ipToBuf(ALARM_AP_IP, ipBuf, sizeof(ipBuf));
+  modeIpBuf[0] = 0;
+  if (cfg.mode == MODE_WIFI && WiFi.status() == WL_CONNECTED && WiFi.localIP()[0]) {
+    ipToBuf(WiFi.localIP(), modeIpBuf, sizeof(modeIpBuf));
+  } else if (cfg.mode == MODE_LAN && ethReady && Ethernet.localIP()[0]) {
+    ipToBuf(Ethernet.localIP(), modeIpBuf, sizeof(modeIpBuf));
+  } else {
+    strncpy(modeIpBuf, ipBuf, sizeof(modeIpBuf) - 1);
+    modeIpBuf[sizeof(modeIpBuf) - 1] = 0;
   }
-  const uint8_t* font = strlen(word) > 8 ? u8g2_font_5x7_tf : u8g2_font_7x13B_tf;
-  u8g2.setFont(font);
-  u8g2.setFontDirection(1);
-  const int span = u8g2.getStrWidth(word);
-  int y = (H - span) / 2;
-  if (y < 1) y = 1;
-  const int glyphW = u8g2.getAscent() - u8g2.getDescent();
-  u8g2.drawStr((W + glyphW) / 2, y, word);
+}
+
+static const char* bleIp() {
+  chosenIps();
+  return modeIpBuf[0] ? modeIpBuf : ipBuf;
+}
+
+static void drawIpScreen() {
+  chosenIps();
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x12_tf);
   u8g2.setFontDirection(0);
+  u8g2.drawStr(0, 14, modeName(cfg.mode));
+  u8g2.drawStr(0, 32, bleIp());
+  u8g2.drawStr(0, 52, "port 5005");
   u8g2.sendBuffer();
 }
 
-static const char* oledWord() {
-  if (wantHome && !wlan.ok) return "NOWIFI";
-  if (wantHome) return "WIFI";
-  if (WiFi.status() == WL_CONNECTED) return "AP";
-  if (!ethUdpReady) return "DHCP";
-  return "LAN";
-}
-
-static void drawConnected() {
-  drawStatusScreen("CONNECTED", false);
-}
-
-static void drawDisconnected() {
-  drawStatusScreen("DISCONNECTED", true);
-}
-
-/** Option A, turned 90° right: text columns on top, tank along the bottom, neck on the right. */
-static void drawLive(float pct, float cm, bool alarming) {
+static void drawLive(float pct, float cm, bool borderOn) {
   int p = 0;
   bool havePct = !(isnan(pct) || pct < 0);
   if (havePct) {
@@ -149,7 +98,6 @@ static void drawLive(float pct, float cm, bool alarming) {
   const int neckH = 12;
   const int bodyW = 116;
   const int bodyH = 64 - ty - 1;
-
   u8g2.clearBuffer();
   u8g2.setFont(u8g2_font_7x13B_tf);
   u8g2.setFontDirection(1);
@@ -167,8 +115,7 @@ static void drawLive(float pct, float cm, bool alarming) {
   if (y < 0) y = 0;
   u8g2.drawStr(108, y, bot);
   u8g2.setFontDirection(0);
-
-  if (alarming) {
+  if (borderOn) {
     u8g2.drawFrame(tx, ty, bodyW, bodyH);
     const int neckY = ty + (bodyH - neckH) / 2;
     u8g2.drawFrame(tx + bodyW, neckY, neckW, neckH);
@@ -176,7 +123,6 @@ static void drawLive(float pct, float cm, bool alarming) {
     u8g2.drawVLine(tx + bodyW, neckY + 1, neckH - 2);
     u8g2.setDrawColor(1);
   }
-
   const int SEGMENTS = 10;
   const int gap = 1;
   const int innerX = tx + 3;
@@ -192,35 +138,454 @@ static void drawLive(float pct, float cm, bool alarming) {
   u8g2.sendBuffer();
 }
 
-static void renderUi(bool live, bool alarming) {
-  if (live) {
-    uiMode = UI_LIVE;
-    drawLive(tank.pct, tank.cm, alarming);
-    return;
-  }
-
-  if (everConnected) {
-    uiMode = UI_DISCONNECTED;
-    drawDisconnected();
-    return;
-  }
-
-  uiMode = UI_WAITING;
-  drawStatusScreen(oledWord(), true);
+static void drawDisconnected() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x12_tf);
+  u8g2.setFontDirection(0);
+  u8g2.drawStr(4, 36, "DISCONNECTED");
+  u8g2.sendBuffer();
 }
 
-static bool sendEth(IPAddress dest, const char* buf) {
-  if (!ethUdpReady) return false;
-  if (!UdpEth.beginPacket(dest, GROUP_PORT)) return false;
+static bool readPat(const char* json, const char* key, BeepPat& p) {
+  char needle[12];
+  snprintf(needle, sizeof(needle), "\"%s\":[", key);
+  const char* s = strstr(json, needle);
+  if (!s) return false;
+  int a, b, c, d, e;
+  if (sscanf(s + strlen(needle), "%d,%d,%d,%d,%d", &a, &b, &c, &d, &e) != 5) return false;
+  p.count = (uint8_t)constrain(a, 1, 5);
+  p.onMs = (uint16_t)constrain(b, 50, 10000);
+  p.innerMs = (uint16_t)constrain(c, 0, 10000);
+  p.groupMs = (uint16_t)constrain(d, 0, 10000);
+  p.times = (uint8_t)constrain(e, 0, 20);
+  return true;
+}
+
+static int jsonUInt(const char* json, const char* key, int fallback) {
+  char needle[16];
+  snprintf(needle, sizeof(needle), "\"%s\":", key);
+  const char* s = strstr(json, needle);
+  if (!s) return fallback;
+  return atoi(s + strlen(needle));
+}
+
+static bool parseStatus(const char* json) {
+  const char* pctp = strstr(json, "\"pct\":");
+  const char* cmp = strstr(json, "\"cm\":");
+  if (!pctp) return false;
+  float pct = atof(pctp + 6);
+  float cm = cmp ? atof(cmp + 5) : NAN;
+  tank.pct = pct < 0 ? NAN : pct;
+  tank.cm = cm < 0 ? NAN : cm;
+  const char* okp = strstr(json, "\"ok\":");
+  tank.fresh = okp ? atoi(okp + 5) != 0 : true;
+  const char* lp = strstr(json, "\"lvl\":");
+  tank.level = lp && atoi(lp + 6) != 0;
+  tank.lastRx = millis();
+  remote.lowPct = (uint8_t)constrain(jsonUInt(json, "lo", remote.lowPct), 1, 100);
+  remote.midPct = (uint8_t)constrain(jsonUInt(json, "md", remote.midPct), 1, 100);
+  remote.highPct = (uint8_t)constrain(jsonUInt(json, "hi", remote.highPct), 1, 100);
+  remote.critPct = (uint8_t)constrain(jsonUInt(json, "cr", remote.critPct), 1, 100);
+  remote.resetPct = (uint8_t)constrain(jsonUInt(json, "rb", remote.resetPct), 1, 100);
+  remote.levelSolid = (uint8_t)jsonUInt(json, "ls", remote.levelSolid) ? 1 : 0;
+  readPat(json, "lp", remote.low);
+  readPat(json, "mp", remote.mid);
+  readPat(json, "hp", remote.high);
+  readPat(json, "cp", remote.crit);
+  return true;
+}
+
+static int heldZone = 0;
+
+static int updateZone() {
+  if (remote.levelSolid && tank.level) {
+    heldZone = 5;
+    return heldZone;
+  }
+  if (heldZone == 5) heldZone = 0;
+  if (!tank.fresh || isnan(tank.pct)) {
+    heldZone = 0;
+    return heldZone;
+  }
+  const float pct = tank.pct;
+  int raw = 0;
+  if (pct >= remote.critPct) raw = 4;
+  else if (pct >= remote.highPct) raw = 3;
+  else if (pct >= remote.midPct) raw = 2;
+  else if (pct <= remote.lowPct + 1.0f && pct >= remote.lowPct - 1.0f) raw = 1;
+  if (raw >= heldZone) heldZone = raw;
+  else if (heldZone == 4 && pct < remote.critPct - 2) heldZone = raw;
+  else if (heldZone == 3 && pct < remote.highPct - 2) heldZone = raw;
+  else if (heldZone == 2 && pct < remote.midPct - 2) heldZone = raw;
+  else if (heldZone == 1 && (pct > remote.lowPct + 3 || pct < remote.lowPct - 3)) heldZone = 0;
+  return heldZone;
+}
+
+static const BeepPat* zonePat(int zone) {
+  if (zone == 1) return &remote.low;
+  if (zone == 2) return &remote.mid;
+  if (zone == 3) return &remote.high;
+  if (zone == 4) return &remote.crit;
+  return nullptr;
+}
+
+static uint32_t groupLen(const BeepPat& p) {
+  uint8_t n = p.count ? p.count : 1;
+  return (uint32_t)n * p.onMs + (n > 1 ? (uint32_t)(n - 1) * p.innerMs : 0);
+}
+
+static bool insideBeeps(const BeepPat& p, uint32_t t) {
+  uint8_t n = p.count ? p.count : 1;
+  for (uint8_t i = 0; i < n; i++) {
+    if (t < p.onMs) return true;
+    t -= p.onMs;
+    if (i + 1 == n) return false;
+    if (t < p.innerMs) return false;
+    t -= p.innerMs;
+  }
+  return false;
+}
+
+static bool patternSound(const BeepPat& p, uint32_t elapsed, bool* busy) {
+  const uint32_t glen = groupLen(p);
+  if (glen == 0) {
+    if (busy) *busy = false;
+    return false;
+  }
+  if (p.times == 0) {
+    const uint32_t cycle = glen + p.groupMs;
+    if (busy) *busy = true;
+    return insideBeeps(p, elapsed % (cycle ? cycle : glen));
+  }
+  const uint32_t total = (uint32_t)p.times * glen + (p.times > 1 ? (uint32_t)(p.times - 1) * p.groupMs : 0);
+  if (elapsed >= total) {
+    if (busy) *busy = false;
+    return false;
+  }
+  if (busy) *busy = true;
+  uint32_t t = elapsed;
+  for (uint8_t g = 0; g < p.times; g++) {
+    if (t < glen) return insideBeeps(p, t);
+    t -= glen;
+    if (g + 1 >= p.times) return false;
+    if (t < p.groupMs) return false;
+    t -= p.groupMs;
+  }
+  return false;
+}
+
+static int zoneMark = -1;
+static uint32_t zoneStart = 0;
+
+static bool alarmSound(uint32_t now, bool* busy) {
+  const int zone = updateZone();
+  if (zone != zoneMark) {
+    zoneMark = zone;
+    zoneStart = now;
+  }
+  if (busy) *busy = false;
+  if (zone == 5) {
+    if (busy) *busy = true;
+    return true;
+  }
+  const BeepPat* p = zonePat(zone);
+  if (!p) return false;
+  return patternSound(*p, now - zoneStart, busy);
+}
+
+static void startRadio() {
+  WiFi.persistent(false);
+  WiFi.setSleep(false);
+  WiFi.setHostname("alarm");
+  const bool sta = cfg.mode == MODE_WIFI && cfg.ssid[0];
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAPConfig(ALARM_AP_IP, ALARM_AP_IP, AP_MASK);
+  WiFi.softAP(ALARM_SSID, LINK_PASS, 6);
+  if (!wifiUdp) {
+    UdpWifi.begin(GROUP_PORT);
+    wifiUdp = true;
+  }
+  if (sta) {
+    WiFi.begin(cfg.ssid, cfg.pass);
+    staTry = millis();
+    Serial.printf("wifi -> %s\n", cfg.ssid);
+  }
+  ipToBuf(ALARM_AP_IP, ipBuf, sizeof(ipBuf));
+  Serial.printf("hotspot %s %s\n", ALARM_SSID, ipBuf);
+}
+
+static void startEthHw() {
+  pinMode(PIN_ETH_CS, OUTPUT);
+  digitalWrite(PIN_ETH_CS, HIGH);
+  pinMode(PIN_ETH_RST, OUTPUT);
+  digitalWrite(PIN_ETH_RST, LOW);
+  delay(40);
+  digitalWrite(PIN_ETH_RST, HIGH);
+  delay(150);
+  SPI.begin(PIN_ETH_SCK, PIN_ETH_MISO, PIN_ETH_MOSI, PIN_ETH_CS);
+  Ethernet.init(PIN_ETH_CS);
+}
+
+static void serviceSta() {
+  if (cfg.mode != MODE_WIFI || !cfg.ssid[0]) return;
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!staUp) {
+      staUp = true;
+      Serial.printf("wifi ip %s\n", WiFi.localIP().toString().c_str());
+    }
+    return;
+  }
+  staUp = false;
+  if (WiFi.status() == WL_IDLE_STATUS) return;
+  if (millis() - staTry < 20000) return;
+  staTry = millis();
+  WiFi.reconnect();
+}
+
+static void serviceEth() {
+  if (cfg.mode != MODE_LAN) return;
+  if (ethReady) {
+    Ethernet.maintain();
+    return;
+  }
+  const uint32_t now = millis();
+  if (!ethHw) {
+    if (now < 2000) return;
+    startEthHw();
+    ethHw = true;
+    dhcpStart = now;
+    dhcpTry = now;
+    Serial.println("LAN DHCP");
+  }
+  if (now < dhcpTry) return;
+  if (now - dhcpStart < 30000) {
+    if (Ethernet.begin(const_cast<uint8_t*>(ALARM_MAC), 400, 200)) {
+      UdpEth.begin(GROUP_PORT);
+      ethHttp.begin();
+      ethReady = true;
+      Serial.printf("LAN %s\n", Ethernet.localIP().toString().c_str());
+    } else dhcpTry = millis() + 8000;
+    return;
+  }
+  Ethernet.begin(const_cast<uint8_t*>(ALARM_MAC), FALLBACK_ALARM_IP, FALLBACK_DNS, FALLBACK_GATEWAY, FALLBACK_SUBNET);
+  UdpEth.begin(GROUP_PORT);
+  ethHttp.begin();
+  ethReady = true;
+  Serial.printf("LAN static %s\n", Ethernet.localIP().toString().c_str());
+}
+
+static String statusJson() {
+  chosenIps();
+  const bool linked = tank.lastRx && millis() - tank.lastRx < 25000;
+  String s = "{\"role\":\"alarm\",\"mode\":\"";
+  s += modeName(cfg.mode);
+  s += "\",\"ap\":\"";
+  s += ipBuf;
+  s += "\",\"ip\":\"";
+  s += modeIpBuf;
+  s += "\",\"link\":";
+  s += linked ? "1" : "0";
+  s += ",\"pct\":";
+  s += isnan(tank.pct) ? "-1" : String(tank.pct, 1);
+  s += ",\"cm\":";
+  s += isnan(tank.cm) ? "-1" : String(tank.cm, 1);
+  s += ",\"lvl\":";
+  s += tank.level ? "1" : "0";
+  s += ",\"muted\":";
+  s += muted ? "1" : "0";
+  s += "}";
+  return s;
+}
+
+static void armReboot() {
+  rebootAt = millis() + 400;
+  if (rebootAt == 0) rebootAt = 1;
+}
+
+static EthernetClient ethClient;
+static char httpBuf[2048];
+static uint16_t httpLen = 0;
+
+static void ethWrite(const String& body, const char* type, int code) {
+  ethClient.printf("HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %u\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n",
+                   code, code == 200 ? "OK" : "Bad Request", type, (unsigned)body.length());
+  ethClient.print(body);
+  ethClient.stop();
+  httpLen = 0;
+}
+
+static void handleSave() {
+  Field fields[40];
+  memset(fields, 0, sizeof(fields));
+  int n = 0;
+  for (int i = 0; i < server.args() && n < 40; i++) {
+    strncpy(fields[n].key, server.argName(i).c_str(), sizeof(fields[n].key) - 1);
+    strncpy(fields[n].val, server.arg(i).c_str(), sizeof(fields[n].val) - 1);
+    n++;
+  }
+  char err[80];
+  if (!applyFields(cfg, false, fields, n, err, sizeof(err))) {
+    chosenIps();
+    server.send(400, "text/html", portalPage(false, cfg, ipBuf, modeIpBuf, err));
+    return;
+  }
+  saveCfg(cfg);
+  server.send(200, "text/html", "<p>Saved. Rebooting into the selected mode.</p>");
+  armReboot();
+}
+
+static String wifiListJson(bool start) {
+  int n = WiFi.scanComplete();
+  if (start && n != WIFI_SCAN_RUNNING) {
+    WiFi.scanDelete();
+    WiFi.scanNetworks(true, true);
+    n = WIFI_SCAN_RUNNING;
+  }
+  if (n < 0) {
+    if (n != WIFI_SCAN_RUNNING) WiFi.scanNetworks(true, true);
+    return "{\"scanning\":1,\"networks\":[]}";
+  }
+  struct Item {
+    char ssid[33];
+    int rssi;
+  } items[16];
+  int count = 0;
+  for (int i = 0; i < n && count < 16; i++) {
+    String ssid = WiFi.SSID(i);
+    if (!ssid.length() || ssid.length() > 32) continue;
+    bool printable = true;
+    for (unsigned j = 0; j < ssid.length(); j++) {
+      if ((unsigned char)ssid[j] < 32) printable = false;
+    }
+    if (!printable) continue;
+    int found = -1;
+    for (int j = 0; j < count; j++) {
+      if (!strcmp(items[j].ssid, ssid.c_str())) found = j;
+    }
+    const int rssi = WiFi.RSSI(i);
+    if (found >= 0) {
+      if (rssi > items[found].rssi) items[found].rssi = rssi;
+      continue;
+    }
+    strncpy(items[count].ssid, ssid.c_str(), 32);
+    items[count].ssid[32] = 0;
+    items[count].rssi = rssi;
+    count++;
+  }
+  for (int i = 0; i < count; i++) {
+    for (int j = i + 1; j < count; j++) {
+      if (items[j].rssi > items[i].rssi) {
+        Item tmp = items[i];
+        items[i] = items[j];
+        items[j] = tmp;
+      }
+    }
+  }
+  String s = "{\"scanning\":0,\"networks\":[";
+  for (int i = 0; i < count; i++) {
+    if (i) s += ',';
+    s += "{\"ssid\":\"";
+    for (const char* p = items[i].ssid; *p; p++) {
+      if (*p == '"' || *p == '\\') s += '\\';
+      s += *p;
+    }
+    s += "\",\"rssi\":";
+    s += items[i].rssi;
+    s += '}';
+  }
+  s += "]}";
+  WiFi.scanDelete();
+  return s;
+}
+
+static void startHttp() {
+  server.on("/", HTTP_GET, []() {
+    chosenIps();
+    server.send(200, "text/html", portalPage(false, cfg, ipBuf, modeIpBuf, ""));
+  });
+  server.on("/api/status", HTTP_GET, []() { server.send(200, "application/json", statusJson()); });
+  server.on("/api/wifi", HTTP_GET, []() {
+    server.send(200, "application/json", wifiListJson(server.hasArg("start")));
+  });
+  server.on("/save", HTTP_POST, handleSave);
+  server.on("/reset", HTTP_POST, []() {
+    clearCfg();
+    server.send(200, "text/html", "<p>Reset. Rebooting to the hotspot.</p>");
+    armReboot();
+  });
+  server.enableCORS(true);
+  server.begin();
+}
+
+static void serviceEthHttp() {
+  if (!ethReady) return;
+  if (!ethClient || !ethClient.connected()) {
+    EthernetClient next = ethHttp.available();
+    if (!next) return;
+    ethClient = next;
+    httpLen = 0;
+  }
+  while (ethClient.available() && httpLen < sizeof(httpBuf) - 1) httpBuf[httpLen++] = (char)ethClient.read();
+  httpBuf[httpLen] = 0;
+  char* headEnd = strstr(httpBuf, "\r\n\r\n");
+  if (!headEnd) {
+    if (httpLen >= sizeof(httpBuf) - 1) ethWrite("too big", "text/plain", 400);
+    return;
+  }
+  int bodyAt = (int)(headEnd - httpBuf) + 4;
+  const char* lenP = strstr(httpBuf, "Content-Length:");
+  int need = 0;
+  if (lenP && lenP < headEnd) need = atoi(lenP + 15);
+  if (need < 0 || bodyAt + need >= (int)sizeof(httpBuf)) {
+    ethWrite("too big", "text/plain", 400);
+    return;
+  }
+  if ((int)httpLen < bodyAt + need) return;
+  httpBuf[bodyAt + need] = 0;
+  char method[8] = {0};
+  char path[48] = {0};
+  sscanf(httpBuf, "%7s %47s", method, path);
+  const bool startScan = strstr(path, "start=1") != nullptr;
+  char* query = strchr(path, '?');
+  if (query) *query = 0;
+  if (!strcmp(method, "GET") && !strcmp(path, "/")) {
+    chosenIps();
+    ethWrite(portalPage(false, cfg, ipBuf, modeIpBuf, ""), "text/html", 200);
+  } else if (!strcmp(method, "GET") && !strcmp(path, "/api/status")) {
+    ethWrite(statusJson(), "application/json", 200);
+  } else if (!strcmp(method, "GET") && !strcmp(path, "/api/wifi")) {
+    ethWrite(wifiListJson(startScan), "application/json", 200);
+  } else if (!strcmp(method, "POST") && !strcmp(path, "/reset")) {
+    clearCfg();
+    ethWrite("Reset. Rebooting.", "text/plain", 200);
+    armReboot();
+  } else if (!strcmp(method, "POST") && !strcmp(path, "/save")) {
+    Field fields[40];
+    int n = parseForm(httpBuf + bodyAt, fields, 40);
+    char err[80];
+    if (!applyFields(cfg, false, fields, n, err, sizeof(err))) {
+      chosenIps();
+      ethWrite(portalPage(false, cfg, ipBuf, modeIpBuf, err), "text/html", 400);
+    } else {
+      saveCfg(cfg);
+      ethWrite("Saved. Rebooting.", "text/plain", 200);
+      armReboot();
+    }
+  } else {
+    ethWrite("not found", "text/plain", 400);
+  }
+  httpLen = 0;
+}
+
+static bool sendUdp(bool wifi, IPAddress dest, const char* buf) {
+  if (wifi) {
+    if (!wifiUdp || !UdpWifi.beginPacket(dest, GROUP_PORT)) return false;
+    UdpWifi.write(reinterpret_cast<const uint8_t*>(buf), strlen(buf));
+    return UdpWifi.endPacket() == 1;
+  }
+  if (!ethReady || !UdpEth.beginPacket(dest, GROUP_PORT)) return false;
   UdpEth.write(reinterpret_cast<const uint8_t*>(buf), strlen(buf));
   return UdpEth.endPacket() == 1;
-}
-
-static bool sendWifiPkt(IPAddress dest, const char* buf) {
-  if (!wifiUdpReady) return false;
-  if (!UdpWifi.beginPacket(dest, GROUP_PORT)) return false;
-  UdpWifi.write(reinterpret_cast<const uint8_t*>(buf), strlen(buf));
-  return UdpWifi.endPacket() == 1;
 }
 
 static IPAddress bcastOf(IPAddress ip, IPAddress sn) {
@@ -229,455 +594,171 @@ static IPAddress bcastOf(IPAddress ip, IPAddress sn) {
   return b;
 }
 
-static void startEthHardware() {
-  pinMode(PIN_ETH_CS, OUTPUT);
-  digitalWrite(PIN_ETH_CS, HIGH);
-  pinMode(PIN_ETH_RST, OUTPUT);
-  digitalWrite(PIN_ETH_RST, LOW);
-  delay(50);
-  digitalWrite(PIN_ETH_RST, HIGH);
-  delay(200);
-  SPI.begin(PIN_ETH_SCK, PIN_ETH_MISO, PIN_ETH_MOSI, PIN_ETH_CS);
-  Ethernet.init(PIN_ETH_CS);
-  SPI.beginTransaction(SPI_ETHERNET_SETTINGS);
-  W5100.writePHYCFGR_W5500(0x00);
-  SPI.endTransaction();
-  delay(50);
-  SPI.beginTransaction(SPI_ETHERNET_SETTINGS);
-  W5100.writePHYCFGR_W5500(0xF8);
-  SPI.endTransaction();
-}
-
-static bool peerFresh() {
-  return tank.lastRx != 0 && (millis() - tank.lastRx) < MODE_DWELL_MS;
-}
-
-static void joinWifi(bool home) {
-  wantHome = home && wlan.ok;
-  appliedHome = wantHome;
-  wifiUdpReady = false;
-  WiFi.persistent(false);
-  WiFi.setSleep(false);
-  WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
-  if (wantHome) WiFi.begin(wlan.ssid, wlan.pass);
-  else WiFi.begin(TANK_AP_SSID, TANK_AP_PASS);
-  wifiBeginAt = millis();
-  uint8_t sta[6];
-  WiFi.macAddress(sta);
-  macToHex(sta, myMacHex);
-  Serial.printf("wifi -> %s\n", wantHome ? wlan.ssid : TANK_AP_SSID);
-}
-
-static void serviceEth() {
-  if (ethUdpReady) {
-    Ethernet.maintain();
-    return;
-  }
-  // A live Wi-Fi peer must not be stalled by a blocking DHCP retry.
-  if (WiFi.status() == WL_CONNECTED && peerFresh()) return;
-  const uint32_t now = millis();
-  if (!ethHwReady) {
-    if (now < 4000) return;
-    startEthHardware();
-    ethHwReady = true;
-    dhcpStartMs = now;
-    dhcpTryAt = now;
-    Serial.println("LAN DHCP, Wi-Fi stays up");
-  }
-  if (now < dhcpTryAt) return;
-  if (now - dhcpStartMs < MODE_DWELL_MS) {
-    int ok = Ethernet.begin(const_cast<uint8_t*>(ALARM_MAC), 400, 200);
-    if (ok) {
-      UdpEth.begin(GROUP_PORT);
-      ethUdpReady = true;
-      Serial.printf("LAN dhcp ip=%s\n", Ethernet.localIP().toString().c_str());
-    } else {
-      dhcpTryAt = millis() + 8000;
-    }
-    return;
-  }
-  Ethernet.begin(const_cast<uint8_t*>(ALARM_MAC), FALLBACK_ALARM_IP, FALLBACK_DNS,
-                 FALLBACK_GATEWAY, FALLBACK_SUBNET);
-  UdpEth.begin(GROUP_PORT);
-  ethUdpReady = true;
-  Serial.printf("LAN static ip=%s\n", Ethernet.localIP().toString().c_str());
-}
-
-static void serviceWifi() {
-  if (wifiBeginAt == 0) joinWifi(false);
-
-  if (WiFi.status() == WL_CONNECTED) {
-    wifiDownSince = 0;
-    if (!wifiUdpReady) {
-      UdpWifi.begin(GROUP_PORT);
-      wifiUdpReady = true;
-      Serial.printf("wifi ip=%s\n", WiFi.localIP().toString().c_str());
-    }
-    return;
-  }
-
-  if (tank.lastRx != 0 && millis() - tank.lastRx < 20000) return;
-  if (wifiDownSince == 0) wifiDownSince = millis();
-  if (millis() - wifiDownSince < 15000) return;
-  wifiDownSince = millis();
-  WiFi.reconnect();
-}
-
-static void pollConsole();
-
-static void serviceNet() {
-  pollConsole();
-  if (reenterMode) {
-    reenterMode = false;
-    wlan = loadWlan();
-    wifiBeginAt = 0;
-  }
-  serviceWifi();
-  serviceEth();
-}
-
-static void onConsoleLine(char* line) {
-  trimInPlace(line);
-  if (!line[0]) return;
-  if (strcasecmp(line, "HELP") == 0 || strcmp(line, "?") == 0) {
-    printLinkHelp(Serial);
-    return;
-  }
-  if (strcasecmp(line, "MODE") == 0) {
-    Serial.printf("eth=%d wifi=%d target=%s\n", ethUdpReady ? 1 : 0, wifiUdpReady ? 1 : 0,
-                  appliedHome ? "home" : "ap");
-    if (ethUdpReady) Serial.printf("lan ip=%s\n", Ethernet.localIP().toString().c_str());
-    if (wifiUdpReady) Serial.printf("wifi ip=%s\n", WiFi.localIP().toString().c_str());
-    return;
-  }
-  int rc = handleWlanLine(line, Serial);
-  if (rc == 1 || rc == 2) reenterMode = true;
-}
-
-static void pollConsole() {
-  while (Serial.available()) {
-    int c = Serial.read();
-    if (c < 0) break;
-    if (c == '\r') continue;
-    if (c == '\n') {
-      consoleLine[consoleLen] = 0;
-      if (consoleLen) onConsoleLine(consoleLine);
-      consoleLen = 0;
-    } else if (consoleLen < sizeof(consoleLine) - 1) {
-      consoleLine[consoleLen++] = (char)c;
-    }
-  }
-}
-
-static bool parseStatus(const char* json) {
-  const char* pctp = strstr(json, "\"pct\":");
-  const char* cmp = strstr(json, "\"cm\":");
-  const char* alp = strstr(json, "\"alarm\":");
-  const char* okp = strstr(json, "\"ok\":");
-  if (!pctp || !alp || !okp) return false;
-  tank.pct = atof(pctp + 6);
-  if (tank.pct < 0) tank.pct = NAN;
-  tank.cm = cmp ? atof(cmp + 5) : NAN;
-  if (tank.cm < 0) tank.cm = NAN;
-  tank.alarm = (uint8_t)atoi(alp + 8);
-  tank.ok = atoi(okp + 5) != 0;
-  const char* lp = strstr(json, "\"lvl\":");
-  tank.level = lp && atoi(lp + 6) != 0;
-  tank.lastRx = millis();
-  return true;
-}
-
-static void blastHello(bool wifi, const char* buf) {
-  IPAddress ip = wifi ? WiFi.localIP() : Ethernet.localIP();
-  IPAddress sn = wifi ? WiFi.subnetMask() : Ethernet.subnetMask();
-  if (ip[0] != 0) {
-    if (wifi) sendWifiPkt(bcastOf(ip, sn), buf);
-    else sendEth(bcastOf(ip, sn), buf);
-  }
-  if (wifi) {
-    sendWifiPkt(IPAddress(255, 255, 255, 255), buf);
-    if (!appliedHome) sendWifiPkt(TANK_AP_IP, buf);
-  } else {
-    sendEth(IPAddress(255, 255, 255, 255), buf);
-  }
-}
-
 static void announceHello() {
-  if (!wifiUdpReady && !ethUdpReady) return;
-  char lanHex[13];
-  char wifiHex[13];
-  macToHex(ALARM_MAC, lanHex);
-  macToHex(ALARM_WIFI_MAC, wifiHex);
+  if (cfg.mode == MODE_NONE) return;
+  if (!wifiUdp && !ethReady) return;
+  char lan[13], wifi[13], mine[13];
+  macToHex(ALARM_MAC, lan);
+  macToHex(ALARM_WIFI_MAC, wifi);
+  uint8_t sta[6];
+  esp_read_mac(sta, ESP_MAC_WIFI_STA);
+  macToHex(sta, mine);
   char buf[180];
   snprintf(buf, sizeof(buf),
            "{\"mac\":\"%s\",\"lan\":\"%s\",\"wifi\":\"%s\",\"role\":\"alarm\",\"hello\":1,\"mode\":%u}",
-           myMacHex, lanHex, wifiHex, appliedHome ? (unsigned)MODE_BOTH_WIFI : (unsigned)MODE_TANK_AP);
-  if (wifiUdpReady) blastHello(true, buf);
-  if (ethUdpReady) blastHello(false, buf);
+           mine, lan, wifi, cfg.mode);
+  if (cfg.mode == MODE_WIFI && wifiUdp && staUp) {
+    sendUdp(true, IPAddress(255, 255, 255, 255), buf);
+    sendUdp(true, bcastOf(WiFi.localIP(), WiFi.subnetMask()), buf);
+    IPAddress ip = WiFi.localIP();
+    if (ip[0] == 192 && ip[1] == 168 && ip[2] == 4) sendUdp(true, TANK_AP_IP, buf);
+  } else if (cfg.mode == MODE_LAN && ethReady) {
+    sendUdp(false, bcastOf(Ethernet.localIP(), Ethernet.subnetMask()), buf);
+    sendUdp(false, IPAddress(255, 255, 255, 255), buf);
+  }
 }
 
-static int alarmStage() {
-  static int stage = 0;
-  if (tank.level) {
-    stage = 4;
-    return stage;
-  }
-  if (stage == 4) stage = 0;
-  int want = 0;
-  if (!isnan(tank.pct)) {
-    if (tank.pct >= 95.0f) want = 3;
-    else if (tank.pct >= 90.0f) want = 2;
-    else if (tank.pct >= 80.0f) want = 1;
-  }
-  if (want >= stage) stage = want;
-  else if (isnan(tank.pct) || tank.pct < 78.0f) stage = 0;
-  else if (stage == 3 && tank.pct < 93.0f) stage = want;
-  else if (stage == 2 && tank.pct < 88.0f) stage = want;
-  return stage;
+static void takeTank(const char* buf) {
+  if (jsonFromTank(buf) && strstr(buf, "\"role\":\"tank\"") && parseStatus(buf)) everConnected = true;
 }
 
-static bool highBeepRunning = false;
-
-static bool beepOn(int stage, uint32_t now) {
-  static int lastStage = -1;
-  static uint32_t mark = 0;
-  if (stage != lastStage) {
-    lastStage = stage;
-    mark = now;
-  }
-  if (stage <= 0) {
-    highBeepRunning = false;
-    return false;
-  }
-  if (stage == 4) {
-    highBeepRunning = true;
-    return true;
-  }
-  const uint32_t onMs = stage == 3 ? 4000 : 400;
-  const uint32_t offMs = stage == 3 ? 1000 : 350;
-  const int count = stage == 1 ? 2 : (stage == 2 ? 3 : 1);
-  const uint32_t elapsed = now - mark;
-  uint32_t t;
-  if (stage == 1 || stage == 2) {
-    const uint32_t once = (uint32_t)count * (onMs + offMs) - offMs;
-    if (elapsed >= once) {
-      highBeepRunning = false;
-      return false;
+static void pollUdp(bool wifi) {
+  if (wifi && cfg.mode != MODE_WIFI) return;
+  if (!wifi && cfg.mode != MODE_LAN) return;
+  if (wifi && !wifiUdp) return;
+  if (!wifi && !ethReady) return;
+  int ps = wifi ? UdpWifi.parsePacket() : UdpEth.parsePacket();
+  while (ps > 0) {
+    char buf[TANK_PACKET_MAX];
+    int n = wifi ? UdpWifi.read(buf, sizeof(buf) - 1) : UdpEth.read(buf, sizeof(buf) - 1);
+    if (n > 0) {
+      buf[n] = 0;
+      takeTank(buf);
     }
-    highBeepRunning = true;
-    t = elapsed;
-  } else {
-    highBeepRunning = true;
-    t = elapsed % (onMs + offMs);
+    ps = wifi ? UdpWifi.parsePacket() : UdpEth.parsePacket();
   }
-  for (int i = 0; i < count; i++) {
-    if (t < onMs) return true;
-    t -= onMs;
-    if (t < offMs) return false;
-    t -= offMs;
-  }
-  return false;
 }
 
-// Two short beeps, five times, 2s between each pair. Plays once each time
-// the level arrives at about 10%.
-static bool lowRunning = false;
-
-static bool lowWaterBeep(uint32_t now) {
-  static bool latched = false;
-  static float prev = NAN;
-  static uint32_t mark = 0;
-
-  const float pct = tank.pct;
-  const bool known = !isnan(pct);
-  if (known && !tank.level) {
-    const bool near = pct <= 11.0f && pct >= 9.0f;
-    const bool crossed = !isnan(prev) && ((prev > 11.0f && pct <= 10.0f) || (prev < 9.0f && pct >= 10.0f));
-    if ((crossed || (isnan(prev) && near)) && !latched && !lowRunning) {
-      lowRunning = true;
-      latched = true;
-      mark = now;
-      Serial.println("low 10%");
-    }
-    if (pct > 13.0f || pct < 7.0f) latched = false;
+static void pollConsole() {
+  static char line[32];
+  static uint8_t len = 0;
+  while (Serial.available()) {
+    int c = Serial.read();
+    if (c == '\n') {
+      line[len] = 0;
+      if (!strcasecmp(line, "RESET")) {
+        clearCfg();
+        ESP.restart();
+      }
+      len = 0;
+    } else if (c != '\r' && len < sizeof(line) - 1) line[len++] = (char)c;
   }
-  if (known) prev = pct;
-  if (!lowRunning) return false;
-
-  const uint32_t groupLen = 300 + 200 + 300 + 2000;
-  const uint32_t t = now - mark;
-  if (t >= groupLen * 5) {
-    lowRunning = false;
-    return false;
-  }
-  const uint32_t g = t % groupLen;
-  if (g < 300) return true;
-  if (g < 500) return false;
-  if (g < 800) return true;
-  return false;
 }
 
 void setup() {
-  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
-
   Serial.begin(115200);
-  delay(300);
-  Serial.println();
-  Serial.println("=== alarm link modes ===");
-  printLinkHelp(Serial);
-  Serial.flush();
-
-  macToHex(ALARM_MAC, myMacHex);
-  uint8_t staMac[6];
-  esp_read_mac(staMac, ESP_MAC_WIFI_STA);
-  char staHex[13];
-  char lanHex[13];
-  macToHex(staMac, staHex);
-  macToHex(ALARM_MAC, lanHex);
-  digitalWrite(PIN_BUZZER, HIGH);
+  delay(200);
+  cfgDefaults(remote);
+  loadCfg(cfg);
+  if (cfg.mode == MODE_AP) cfg.mode = MODE_NONE;
   pinMode(PIN_BUZZER, OUTPUT);
   pinMode(PIN_RELAY, OUTPUT);
   pinMode(PIN_MUTE, INPUT_PULLDOWN);
   pinMode(32, INPUT_PULLDOWN);
-  muted = false;
-  Serial.println("boot: alarm mode");
-  Serial.printf("touch idle gpio33=%d gpio32=%d (hold either HIGH for 2s)\n",
-                digitalRead(PIN_MUTE) == HIGH, digitalRead(32) == HIGH);
   digitalWrite(PIN_BUZZER, HIGH);
   digitalWrite(PIN_RELAY, LOW);
-  Serial.printf("LAN  MAC %s\n", lanHex);
-  Serial.printf("WIFI MAC %s\n", staHex);
-  wlan = loadWlan();
-  if (wlan.ok) Serial.printf("saved WLAN ssid=%s\n", wlan.ssid);
-  else Serial.println("saved WLAN: (not set)");
-
   Wire.begin(PIN_SDA, PIN_SCL);
-  delay(50);
   u8g2.begin();
-  drawBootLogo();
-
-  joinWifi(false);
-  uiMode = UI_WAITING;
-  drawStatusScreen(oledWord(), true);
-  Serial.println("alarm ready");
-  Serial.flush();
+  startRadio();
+  startHttp();
+  drawIpScreen();
+  Serial.printf("open http://%s:%u\n", bleIp(), HTTP_PORT);
+  Serial.println("touch GPIO33: hold 2s = mute or alarm reset");
 }
 
 void loop() {
   static uint32_t lastHello = 0;
   static uint32_t lastUi = 0;
+  static bool shownSound = false;
+  static float prevPct = NAN;
   const uint32_t now = millis();
-
-  serviceNet();
-
-  const uint32_t helloEvery = peerLocked ? HELLO_SLOW_MS : HELLO_FAST_MS;
-  if (now - lastHello >= helloEvery) {
+  const int bootReset = pollBootReset(cfg);
+  if (bootReset == 1) {
+    Serial.println("BOOT 5s: settings cleared, release to restart");
+    digitalWrite(PIN_BUZZER, LOW);
+    delay(160);
+    digitalWrite(PIN_BUZZER, HIGH);
+  }
+  pollConsole();
+  serviceSta();
+  serviceEth();
+  server.handleClient();
+  serviceEthHttp();
+  pollUdp(true);
+  pollUdp(false);
+  if (cfg.mode != MODE_NONE && now - lastHello >= (everConnected ? 15000 : 2000)) {
     lastHello = now;
     announceHello();
   }
 
-  auto takeTank = [](const char* buf) {
-    if (jsonFromTank(buf) && strstr(buf, "\"role\":\"tank\"") && parseStatus(buf)) {
-      peerLocked = true;
-    }
-  };
-  if (wifiUdpReady) {
-    int ps = UdpWifi.parsePacket();
-    while (ps > 0) {
-      char buf[TANK_PACKET_MAX];
-      int n = UdpWifi.read(buf, sizeof(buf) - 1);
-      if (n > 0) {
-        buf[n] = 0;
-        takeTank(buf);
-      }
-      ps = UdpWifi.parsePacket();
-    }
-  }
-  if (ethUdpReady) {
-    int ps = UdpEth.parsePacket();
-    while (ps > 0) {
-      char buf[TANK_PACKET_MAX];
-      int n = UdpEth.read(buf, sizeof(buf) - 1);
-      if (n > 0) {
-        buf[n] = 0;
-        takeTank(buf);
-      }
-      ps = UdpEth.parsePacket();
-    }
-  }
-
-  const int stage = alarmStage();
-  static bool pressing = false;
+  const int zone = updateZone();
+  static bool held = false;
   static bool acted = false;
   static uint32_t downAt = 0;
   static uint32_t lastHigh = 0;
-  static bool raw33Was = false;
-  static bool raw32Was = false;
-  static float prevPct = NAN;
-  if (!tank.level && !isnan(tank.pct) && !isnan(prevPct) && prevPct >= 50.0f && tank.pct < 50.0f && muted) {
+  const bool raw = digitalRead(PIN_MUTE) == HIGH || digitalRead(32) == HIGH;
+  if (raw) lastHigh = now;
+  if (raw && !held) {
+    held = true;
+    acted = false;
+    downAt = now;
+  }
+  if (held && !acted && now - downAt >= 2000 && now - lastHigh < 200) {
+    acted = true;
+    muted = !muted;
+    Serial.println(muted ? "mute" : "alarm reset");
+  }
+  if (held && !raw && now - lastHigh >= 200) held = false;
+  if (!tank.level && !isnan(tank.pct) && !isnan(prevPct) && prevPct >= remote.resetPct && tank.pct < remote.resetPct && muted) {
     muted = false;
     Serial.println("auto reset");
   }
   if (!isnan(tank.pct)) prevPct = tank.pct;
 
-  const bool raw33 = digitalRead(PIN_MUTE) == HIGH;
-  const bool raw32 = digitalRead(32) == HIGH;
-  if (raw33 != raw33Was) {
-    Serial.printf("gpio33 %d\n", raw33 ? 1 : 0);
-    raw33Was = raw33;
-  }
-  if (raw32 != raw32Was) {
-    Serial.printf("gpio32 %d\n", raw32 ? 1 : 0);
-    raw32Was = raw32;
-  }
-  const bool raw = raw33 || raw32;
-  if (raw) lastHigh = now;
-  if (raw && !pressing) {
-    pressing = true;
-    acted = false;
-    downAt = now;
-  }
-  if (pressing && !acted && (now - downAt >= 2000) && (now - lastHigh < 200)) {
-    acted = true;
-    muted = !muted;
-    Serial.printf("%s gpio33=%d gpio32=%d\n", muted ? "mute" : "alarm reset", raw33 ? 1 : 0, raw32 ? 1 : 0);
-  }
-  if (pressing && !raw && (now - lastHigh >= 200)) {
-    if (!acted) Serial.printf("touch short %lums\n", (unsigned long)(now - downAt));
-    pressing = false;
-  }
-
   const uint32_t rxNow = millis();
-  uint32_t rxAge = 0xFFFFFFFFu;
-  if (tank.lastRx != 0) rxAge = (rxNow >= tank.lastRx) ? (rxNow - tank.lastRx) : 0;
-  const bool fresh = rxAge <= STALE_MS;
-  const bool linked = rxAge <= 25000;
+  uint32_t age = 0xFFFFFFFFu;
+  if (tank.lastRx) age = (rxNow >= tank.lastRx) ? rxNow - tank.lastRx : 0;
+  const bool linked = age <= 25000;
   static uint32_t unlinkAt = 0;
   if (linked) unlinkAt = 0;
-  else if (unlinkAt == 0) unlinkAt = rxNow;
-  const bool live = tank.lastRx != 0 && (linked || (rxNow - unlinkAt) < 3000);
-  if (fresh) {
-    peerLocked = true;
-    everConnected = true;
-  } else if (!linked) {
-    peerLocked = false;
-  }
+  else if (everConnected && unlinkAt == 0) unlinkAt = rxNow;
+  const bool showTank = everConnected && (linked || (unlinkAt && rxNow - unlinkAt < 3000));
 
-  const bool lowOn = lowWaterBeep(now);
-  const bool highTone = beepOn(stage, now);
-  const bool high = linked && !muted && highTone;
-  const bool low = linked && !muted && stage == 0 && lowOn;
-  digitalWrite(PIN_BUZZER, (high || low) ? LOW : HIGH);
-  digitalWrite(PIN_RELAY, (linked && !muted && stage > 0) ? HIGH : LOW);
+  bool busy = false;
+  const bool tone = alarmSound(now, &busy);
+  const bool sound = linked && !muted && tone;
+  digitalWrite(PIN_BUZZER, sound ? LOW : HIGH);
+  digitalWrite(PIN_RELAY, (linked && !muted && zone >= 2) ? HIGH : LOW);
 
-  const bool sounding = high || low;
-  static bool shownSound = false;
-  if (sounding != shownSound || now - lastUi >= 100) {
-    shownSound = sounding;
+  if (bootReset) {
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_6x12_tf);
+    u8g2.setFontDirection(0);
+    u8g2.drawStr(0, 28, "Settings cleared");
+    u8g2.drawStr(0, 48, "Release BOOT");
+    u8g2.sendBuffer();
+  } else if (sound != shownSound || now - lastUi >= 250) {
+    shownSound = sound;
     lastUi = now;
-    const bool pattern = highBeepRunning || lowRunning;
-    const bool borderOn = !(linked && !muted && pattern) || sounding;
-    renderUi(live, borderOn);
+    if (showTank) {
+      const bool borderOn = !(linked && !muted && busy) || sound;
+      drawLive(tank.pct, tank.cm, borderOn);
+    } else if (everConnected && !showTank) {
+      drawDisconnected();
+    } else {
+      drawIpScreen();
+    }
   }
+  blePublishIp(bleIp());
+  if (rebootAt && (int32_t)(now - rebootAt) >= 0) ESP.restart();
 }

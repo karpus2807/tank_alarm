@@ -17,8 +17,8 @@ static const int PIN_ECHO = 7; // pad labeled Echo / TX (via divider)
 static const int PIN_LEVEL = 4;
 
 // Tank geometry: measure once and tune.
-static const float TANK_EMPTY_CM = 150.0f;
-static const float TANK_FULL_CM = 15.0f;
+static const float TANK_EMPTY_CM = 140.0f;
+static const float TANK_FULL_CM = 25.0f;
 static const uint8_t TANK_ID = 1;
 
 static const float WARN_PERCENT = 90.0f;
