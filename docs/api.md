@@ -42,10 +42,10 @@ JSON routes send `Access-Control-Allow-Origin: *`. A bad form POST returns the H
 | `ip` | Address to open. Hotspot address when Wi-Fi or LAN has no address yet |
 | `cm` | Smoothed distance from the sensor down to the water. `-1` if there is no reading |
 | `pct` | Fill percent from empty and full distance. `-1` if `cm` is missing |
-| `stable` | `1` when recent readings agree. The alarm beeps only while this is `1` |
+| `stable` | `1` when recent ultrasonic readings agree. The percent beeps run only while this is `1` |
 | `spread` | Spread of recent readings, centimetres |
 | `share` | `1` when the hotspot is sharing Wi-Fi or LAN internet |
-| `lvl` | Level sensor. `1` is water, `0` is dry. This does not change `pct` |
+| `lvl` | Level sensor. `1` means the tank is full. The alarm then sounds continuously until touch mute. This does not change `pct` |
 | `link` | `1` when an alarm packet arrived in the last 20 seconds |
 
 ### `GET /`
@@ -71,7 +71,7 @@ Lists Wi-Fi networks. `GET /api/wifi?start=1` starts a scan. Poll `GET /api/wifi
 | `pass` | Password, 8 to 64 characters. Blank keeps the old password when the name did not change |
 | `empty` | Sensor distance when the tank is empty, centimetres |
 | `full` | Sensor distance when the tank is full, centimetres. Must be at least 2 cm below `empty` |
-| `ls` | `1` if the level sensor should hold a solid beep. Omit when off |
+| `ls` | Kept for old pages. The level-sensor beep is always on when `lvl` is `1` |
 | `rb` | Auto-unmute percent. Must be below the mid level |
 | `low`, `mid`, `high`, `crit` | Four rising percents |
 | `ln` `lo` `li` `lg` `lt` | Low pattern: beep count, on ms, gap ms, group gap ms, times. `lt` `0` means until mute |

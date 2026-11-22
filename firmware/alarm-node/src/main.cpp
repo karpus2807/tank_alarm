@@ -198,7 +198,7 @@ static bool parseStatus(const char* json) {
 static int heldZone = 0;
 
 static int updateZone() {
-  if (remote.levelSolid && tank.level) {
+  if (tank.level) {
     heldZone = 5;
     return heldZone;
   }

@@ -338,7 +338,7 @@ inline bool applyFields(Cfg& c, bool tank, Field* f, int n, char* err, size_t er
     next.highPct = (uint8_t)high;
     next.critPct = (uint8_t)crit;
     next.resetPct = (uint8_t)reset;
-    next.levelSolid = fieldGet(f, n, "ls") && !strcmp(fieldGet(f, n, "ls"), "1");
+    next.levelSolid = 1;
     readPatFields(f, n, "l", next.low);
     readPatFields(f, n, "m", next.mid);
     readPatFields(f, n, "h", next.high);
@@ -430,9 +430,7 @@ inline String portalPage(bool tank, const Cfg& c, const char* hotspotIp, const c
     s += String(c.emptyCm, 1);
     s += "'> Full cm <input name=full value='";
     s += String(c.fullCm, 1);
-    s += "'><br><label><input type=checkbox name=ls value=1";
-    if (c.levelSolid) s += " checked";
-    s += "> Level sensor holds a solid beep</label><br>Auto reset below <input name=rb value='";
+    s += "'><br>Level sensor 1 holds a solid beep until touch mute.<br>Auto reset below <input name=rb value='";
     s += c.resetPct;
     s += "' size=3>%</p>";
     s += "<table border=1 cellpadding=4><tr><th></th><th>%</th><th>beeps</th><th>on ms</th><th>gap</th><th>group</th><th>times 0=mute</th></tr>";
