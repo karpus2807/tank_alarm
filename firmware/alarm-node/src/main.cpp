@@ -3,6 +3,8 @@
 #include <SPI.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <WebServer.h>
+#include <DNSServer.h>
 #include <Wire.h>
 #include <Ethernet.h>
 #include <EthernetUdp.h>
@@ -57,10 +59,18 @@ static WlanCreds wlan{};
 static char consoleLine[128];
 static uint8_t consoleLen = 0;
 
-// When a saved home profile will not associate, fall back to the tank hotspot
-// so the link (and OLED / peer path over TankAlarmLink) stays reachable.
+// SoftAP (config WebUI) must stay up. STA joins home or tank peer AP.
+// Failed STA associates can disrupt SoftAP on ESP32 — reassert / AP-first.
 static const uint32_t HOME_CONNECT_TIMEOUT_MS = 30000;
 static const uint32_t HOME_RETRY_MS = 120000;
+static const uint32_t AP_REASSERT_MS = 20000;
+static const uint32_t STA_AP_ONLY_MS = 45000;
+static bool softApUp = false;
+static bool apOnlyNoSta = false;
+static uint32_t apReassertAt = 0;
+static uint32_t staFailSince = 0;
+static WebServer web(80);
+static DNSServer dns;
 static bool muted = false;
 static bool peerLocked = false;
 static bool everConnected = false;
@@ -117,9 +127,10 @@ static void drawStatusScreen(const char* word, bool blinkBorder) {
 }
 
 static const char* oledWord() {
+  if (softApUp && WiFi.status() != WL_CONNECTED) return "CFG";
   if (wantHome && !wlan.ok) return "NOWIFI";
   if (wantHome) return "WIFI";
-  if (WiFi.status() == WL_CONNECTED) return "AP";
+  if (WiFi.status() == WL_CONNECTED) return appliedHome ? "WIFI" : "TAP";
   if (!ethUdpReady) return "DHCP";
   return "LAN";
 }
@@ -257,21 +268,172 @@ static bool peerFresh() {
   return tank.lastRx != 0 && (millis() - tank.lastRx) < MODE_DWELL_MS;
 }
 
-static void joinWifi(bool home) {
+static bool startSoftAp(bool withSta) {
+  WiFi.persistent(false);
+  WiFi.setSleep(false);
+  WiFi.mode(withSta ? WIFI_AP_STA : WIFI_AP);
+  WiFi.setAutoReconnect(true);
+  WiFi.softAPConfig(ALARM_AP_IP, ALARM_AP_IP, ALARM_AP_MASK);
+  if (!WiFi.softAP(ALARM_AP_SSID, ALARM_AP_PASS, 6)) {
+    Serial.println("alarm SoftAP failed");
+    softApUp = false;
+    return false;
+  }
+  softApUp = true;
+  dns.stop();
+  dns.start(53, "*", ALARM_AP_IP);
+  return true;
+}
+
+static void startSta(bool home) {
   wantHome = home && wlan.ok;
   appliedHome = wantHome;
   wifiUdpReady = false;
-  WiFi.persistent(false);
-  WiFi.setSleep(false);
-  WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
+  wifiBeginAt = millis();
+  staFailSince = millis();
+  apOnlyNoSta = false;
   if (wantHome) WiFi.begin(wlan.ssid, wlan.pass);
   else WiFi.begin(TANK_AP_SSID, TANK_AP_PASS);
-  wifiBeginAt = millis();
   uint8_t sta[6];
   WiFi.macAddress(sta);
   macToHex(sta, myMacHex);
-  Serial.printf("wifi -> %s\n", wantHome ? wlan.ssid : TANK_AP_SSID);
+  Serial.printf("sta -> %s\n", wantHome ? wlan.ssid : TANK_AP_SSID);
+}
+
+static void ensureSoftAp(bool withSta) {
+  if (!startSoftAp(withSta)) return;
+  apReassertAt = millis();
+  Serial.printf("SoftAP %s ip=%s (%s)\n", ALARM_AP_SSID,
+                WiFi.softAPIP().toString().c_str(),
+                withSta ? "AP+STA" : "AP-only");
+}
+
+static void enterApOnlyConfig(const char* reason) {
+  apOnlyNoSta = true;
+  wifiUdpReady = false;
+  wantHome = false;
+  appliedHome = false;
+  WiFi.disconnect(false);
+  ensureSoftAp(false);
+  wifiBeginAt = millis();
+  Serial.printf("STA paused (%s); SoftAP WebUI stays up\n", reason);
+}
+
+static String htmlEscape(const String& s) {
+  String o;
+  o.reserve(s.length() + 8);
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '&') o += "&amp;";
+    else if (c == '<') o += "&lt;";
+    else if (c == '>') o += "&gt;";
+    else if (c == '"') o += "&quot;";
+    else o += c;
+  }
+  return o;
+}
+
+static void handleRoot() {
+  const bool staUp = WiFi.status() == WL_CONNECTED;
+  String body;
+  body.reserve(1800);
+  body += F("<!DOCTYPE html><html><head><meta name=viewport content=\"width=device-width,initial-scale=1\">"
+            "<title>Tank Alarm</title><style>"
+            "body{font-family:system-ui,sans-serif;margin:1.2rem;background:#0f1419;color:#e7ecf1}"
+            "h1{font-size:1.35rem;margin:0 0 .4rem} .muted{color:#9aa7b5;font-size:.9rem}"
+            ".box,form{display:block;background:#1a222c;padding:1rem;border-radius:10px;margin:1rem 0}"
+            "label{display:block;margin:.6rem 0 .2rem;font-size:.85rem} input{width:100%;padding:.55rem;border-radius:6px;"
+            "border:1px solid #334155;background:#0f1419;color:#e7ecf1;box-sizing:border-box}"
+            "button{margin-top:.9rem;padding:.65rem 1rem;border:0;border-radius:8px;background:#3b82f6;color:#fff;"
+            "font-weight:600;width:100%} .danger{background:#b91c1c} .ok{color:#4ade80} .bad{color:#f87171}"
+            "</style></head><body>");
+  body += F("<h1>Tank Alarm</h1><p class=muted>Config hotspot &amp; status</p>");
+  body += F("<div class=box><b>SoftAP</b><br>");
+  body += htmlEscape(ALARM_AP_SSID);
+  body += F("<br>WebUI <code>http://192.168.5.1/</code></div>");
+  body += F("<div class=box><b>STA peer link</b><br>");
+  if (staUp) {
+    body += F("<span class=ok>connected</span> to ");
+    body += htmlEscape(appliedHome ? String(wlan.ssid) : String(TANK_AP_SSID));
+    body += F("<br>IP ");
+    body += WiFi.localIP().toString();
+  } else if (apOnlyNoSta) {
+    body += F("<span class=bad>paused</span> — SoftAP/WebUI preferred; will retry STA");
+  } else {
+    body += F("<span class=bad>connecting…</span> target ");
+    body += htmlEscape(wantHome && wlan.ok ? String(wlan.ssid) : String(TANK_AP_SSID));
+  }
+  body += F("<br>Peer: ");
+  body += peerFresh() ? F("<span class=ok>tank linked</span>") : F("<span class=bad>no tank yet</span>");
+  body += F("</div><div class=box><b>Saved home Wi-Fi</b><br>");
+  if (wlan.ok) {
+    body += F("SSID ");
+    body += htmlEscape(wlan.ssid);
+  } else {
+    body += F("(not set)");
+  }
+  body += F("</div><form method=POST action=/wifi>"
+            "<b>Set home Wi-Fi</b>"
+            "<label>SSID</label><input name=ssid maxlength=32 required>"
+            "<label>Password</label><input name=pass type=password maxlength=64>"
+            "<button type=submit>Save &amp; connect</button></form>"
+            "<form method=POST action=/wifi/clear>"
+            "<button class=danger type=submit>Clear home Wi-Fi</button></form>"
+            "<p class=muted>After save, alarm keeps this SoftAP so you can reconnect if home Wi-Fi fails."
+            " Peer link uses STA (home or tank hotspot).</p></body></html>");
+  web.send(200, "text/html", body);
+}
+
+static void handleWifiPost() {
+  String ssid = web.arg("ssid");
+  String pass = web.arg("pass");
+  ssid.trim();
+  pass.trim();
+  if (ssid.length() == 0 || ssid.length() > 32 || pass.length() > 64) {
+    web.send(400, "text/plain", "Bad SSID/password length");
+    return;
+  }
+  if (!saveWlan(ssid.c_str(), pass.c_str())) {
+    web.send(500, "text/plain", "Save failed");
+    return;
+  }
+  wlan = loadWlan();
+  reenterMode = true;
+  web.sendHeader("Location", "/");
+  web.send(303, "text/plain", "Saved");
+  Serial.printf("WebUI WLAN saved ssid=%s\n", wlan.ssid);
+}
+
+static void handleWifiClear() {
+  clearWlan();
+  wlan = loadWlan();
+  reenterMode = true;
+  web.sendHeader("Location", "/");
+  web.send(303, "text/plain", "Cleared");
+  Serial.println("WebUI WLAN cleared");
+}
+
+static void handleCaptive() {
+  web.sendHeader("Location", String("http://") + ALARM_AP_IP.toString() + "/");
+  web.send(302, "text/plain", "");
+}
+
+static void setupWebUi() {
+  web.on("/", HTTP_GET, handleRoot);
+  web.on("/wifi", HTTP_POST, handleWifiPost);
+  web.on("/wifi/clear", HTTP_POST, handleWifiClear);
+  web.on("/generate_204", HTTP_GET, handleCaptive);
+  web.on("/hotspot-detect.html", HTTP_GET, handleCaptive);
+  web.on("/fwlink", HTTP_GET, handleCaptive);
+  web.onNotFound(handleRoot);
+  web.begin();
+  Serial.println("WebUI http://192.168.5.1/");
+}
+
+static void serviceWeb() {
+  if (!softApUp) return;
+  dns.processNextRequest();
+  web.handleClient();
 }
 
 static void serviceEth() {
@@ -310,16 +472,37 @@ static void serviceEth() {
 }
 
 static void serviceWifi() {
-  // Prefer saved home Wi-Fi when present; otherwise join the tank SoftAP.
-  if (wifiBeginAt == 0) joinWifi(wlan.ok);
+  // SoftAP first — WebUI must stay reachable for phone config.
+  if (!softApUp) {
+    ensureSoftAp(!apOnlyNoSta);
+    if (!softApUp) return;
+    if (!apOnlyNoSta && wifiBeginAt == 0) startSta(wlan.ok);
+  }
+
+  // AP-only window: SoftAP/WebUI only; periodically retry STA.
+  if (apOnlyNoSta) {
+    if (millis() - wifiBeginAt < HOME_RETRY_MS) return;
+    ensureSoftAp(true);
+    startSta(wlan.ok);
+    Serial.println("retry STA while SoftAP stays up");
+    return;
+  }
 
   if (WiFi.status() == WL_CONNECTED) {
     wifiDownSince = 0;
+    staFailSince = 0;
     if (!wifiUdpReady) {
       UdpWifi.begin(GROUP_PORT);
       wifiUdpReady = true;
-      Serial.printf("wifi ip=%s (%s)\n", WiFi.localIP().toString().c_str(),
+      Serial.printf("sta ip=%s (%s)\n", WiFi.localIP().toString().c_str(),
                     appliedHome ? "home" : "tank-ap");
+    }
+    // SoftAP can vanish after STA events — keep reasserting while linked.
+    if (millis() - apReassertAt >= AP_REASSERT_MS) {
+      WiFi.softAPConfig(ALARM_AP_IP, ALARM_AP_IP, ALARM_AP_MASK);
+      WiFi.softAP(ALARM_AP_SSID, ALARM_AP_PASS, 6);
+      softApUp = true;
+      apReassertAt = millis();
     }
     return;
   }
@@ -328,21 +511,41 @@ static void serviceWifi() {
   // blip does not instantly force tank-AP fallback.
   if (wifiUdpReady) {
     wifiBeginAt = millis();
+    staFailSince = millis();
     wifiUdpReady = false;
   }
+  if (staFailSince == 0) staFailSince = millis();
 
-  // Saved home profile will not associate → fall back to tank hotspot.
+  // Prolonged STA failure → drop STA briefly so SoftAP/WebUI stays usable.
+  if ((millis() - staFailSince) >= STA_AP_ONLY_MS) {
+    enterApOnlyConfig("timeout");
+    return;
+  }
+
+  // Saved home profile will not associate → fall back to tank hotspot (STA), SoftAP stays.
   if (appliedHome && (millis() - wifiBeginAt) >= HOME_CONNECT_TIMEOUT_MS) {
-    Serial.println("home wifi failed; joining tank AP");
-    joinWifi(false);
+    Serial.println("home wifi failed; STA -> tank AP (SoftAP stays)");
+    ensureSoftAp(true);
+    startSta(false);
     return;
   }
 
   // On tank AP with saved credentials, periodically retry home.
   if (!appliedHome && wlan.ok && (millis() - wifiBeginAt) >= HOME_RETRY_MS) {
-    Serial.println("retry home wifi");
-    joinWifi(true);
+    Serial.println("retry home wifi (SoftAP stays)");
+    ensureSoftAp(true);
+    startSta(true);
     return;
+  }
+
+  // Re-assert SoftAP before reconnect; failed STA associates often take AP down.
+  if (millis() - apReassertAt >= AP_REASSERT_MS) {
+    WiFi.softAPConfig(ALARM_AP_IP, ALARM_AP_IP, ALARM_AP_MASK);
+    WiFi.softAP(ALARM_AP_SSID, ALARM_AP_PASS, 6);
+    softApUp = true;
+    apReassertAt = millis();
+    if (WiFi.status() != WL_IDLE_STATUS) WiFi.reconnect();
+    Serial.println("reassert SoftAP + STA reconnect");
   }
 
   if (tank.lastRx != 0 && millis() - tank.lastRx < 20000) return;
@@ -362,8 +565,13 @@ static void serviceNet() {
     wifiBeginAt = 0;
     wifiDownSince = 0;
     wifiUdpReady = false;
+    staFailSince = 0;
+    apOnlyNoSta = false;
+    ensureSoftAp(true);
+    startSta(wlan.ok);
   }
   serviceWifi();
+  serviceWeb();
   serviceEth();
 }
 
@@ -375,10 +583,12 @@ static void onConsoleLine(char* line) {
     return;
   }
   if (strcasecmp(line, "MODE") == 0) {
-    Serial.printf("eth=%d wifi=%d target=%s\n", ethUdpReady ? 1 : 0, wifiUdpReady ? 1 : 0,
-                  appliedHome ? "home" : "ap");
+    Serial.printf("eth=%d sta=%d softap=%d target=%s\n", ethUdpReady ? 1 : 0, wifiUdpReady ? 1 : 0,
+                  softApUp ? 1 : 0, appliedHome ? "home" : "tank-ap");
     if (ethUdpReady) Serial.printf("lan ip=%s\n", Ethernet.localIP().toString().c_str());
-    if (wifiUdpReady) Serial.printf("wifi ip=%s\n", WiFi.localIP().toString().c_str());
+    if (softApUp) Serial.printf("ap ip=%s ssid=%s\n", WiFi.softAPIP().toString().c_str(), ALARM_AP_SSID);
+    if (wifiUdpReady) Serial.printf("sta ip=%s\n", WiFi.localIP().toString().c_str());
+    Serial.println("WebUI http://192.168.5.1/");
     return;
   }
   int rc = handleWlanLine(line, Serial);
@@ -587,9 +797,12 @@ void setup() {
   u8g2.begin();
   drawBootLogo();
 
-  joinWifi(wlan.ok);
+  ensureSoftAp(true);
+  setupWebUi();
+  startSta(wlan.ok);
   uiMode = UI_WAITING;
   drawStatusScreen(oledWord(), true);
+  Serial.printf("join %s / %s then WebUI http://192.168.5.1/\n", ALARM_AP_SSID, ALARM_AP_PASS);
   Serial.println("alarm ready");
   Serial.flush();
 }

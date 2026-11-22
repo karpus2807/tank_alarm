@@ -41,6 +41,13 @@ static const char TANK_AP_PASS[] = "TankAlarm#5";
 static const IPAddress TANK_AP_IP(192, 168, 4, 1);
 static const IPAddress TANK_AP_MASK(255, 255, 255, 0);
 
+// Alarm's own SoftAP for phone/laptop WebUI (WiFi config + status).
+// Different subnet from tank SoftAP so AP+STA (peer on TankAlarmLink / home) does not collide.
+static const char ALARM_AP_SSID[] = "TankAlarmConfig";
+static const char ALARM_AP_PASS[] = "TankAlarm#cfg";
+static const IPAddress ALARM_AP_IP(192, 168, 5, 1);
+static const IPAddress ALARM_AP_MASK(255, 255, 255, 0);
+
 inline const char* linkModeName(LinkMode m) {
   switch (m) {
     case MODE_LAN_DHCP: return "LAN-DHCP";
@@ -78,4 +85,6 @@ inline void printLinkHelp(Stream& out) {
   out.println("  WIFI?");
   out.println("  WIFI CLEAR");
   out.println("Mode 5 is already set: TankAlarmLink / TankAlarm#5");
+  out.println("Alarm config hotspot (always): TankAlarmConfig / TankAlarm#cfg");
+  out.println("  WebUI http://192.168.5.1/");
 }
