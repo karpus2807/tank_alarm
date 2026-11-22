@@ -10,11 +10,12 @@
 | 4 | USB supply | Tank | Phone charger / power bank / adapter |
 | 5 | ESP32 DevKit V1 | Alarm (ground) | Controller (USB power) |
 | 6 | W5500 #2 | Alarm | Ethernet |
-| 7 | OLED 0.91" I2C (SSD1306) | Alarm | Display |
-| 8 | Active buzzer | Alarm | Local beep |
-| 9 | Relay module (optional) | Alarm | Old siren 2-pin short |
-| 10 | Mute button (optional) | Alarm | Silence toggle |
-| 11 | USB supply | Alarm | Phone charger / adapter |
+| 7 | OLED 1.3" I2C (SH1106 128×64) | Alarm | Display |
+| 8 | 3-pin active buzzer | Alarm | Sound when I/O is LOW |
+| 9 | Relay module | Alarm | ON while the high alarm is unmuted |
+| 10 | TTP223 touch | Alarm | 2 second hold toggles mute |
+| 11 | Pipe level sensor | Tank | Wet = HIGH on GPIO4 |
+| 12 | USB supply | Alarm | Phone charger / adapter |
 
 ---
 
@@ -36,6 +37,10 @@
 | JSN-SR04T | GND | `GND` | |
 | JSN-SR04T | Trig / RX | **GPIO6** | use as Trig |
 | JSN-SR04T | Echo / TX | **GPIO7** | via 2.2k + 3.3k divider |
+| Level sensor | brown | **5V** | supply |
+| Level sensor | blue | `GND` | common ground |
+| Level sensor | yellow | **GPIO4** | HIGH = water, LOW = dry. `INPUT_PULLDOWN` |
+| Level sensor | black | open | do not connect |
 
 ### Echo divider
 
@@ -60,28 +65,31 @@
 | W5500 | CS | **GPIO4** | not GPIO5/15 (boot strap) |
 | W5500 | RST | **GPIO17** | |
 | W5500 | INT | GPIO16 | optional, unused in code |
-| OLED 0.91" | VCC | **3.3V** | not 5V |
-| OLED 0.91" | GND | `GND` | |
-| OLED 0.91" | SDA | **GPIO21** | I2C addr `0x3C` |
-| OLED 0.91" | SCL | **GPIO22** | |
-| Buzzer | + | **GPIO26** | transistor if high current |
-| Buzzer | − | `GND` | |
-| Relay IN | IN | **GPIO27** | optional old alarm |
+| OLED 1.3" SH1106 | VCC | **3.3V** | not 5V |
+| OLED 1.3" SH1106 | GND | `GND` | |
+| OLED 1.3" SH1106 | SDA | **GPIO21** | |
+| OLED 1.3" SH1106 | SCL | **GPIO22** | |
+| Buzzer | VCC | `5V` or `3.3V` | check the module |
+| Buzzer | GND | `GND` | |
+| Buzzer | I/O | **GPIO26** | LOW = sound, HIGH = quiet |
+| Relay IN | IN | **GPIO27** | HIGH while an unmuted 80/90/95/level alarm is active |
 | Relay | VCC / GND | `5V` / `GND` | |
-| Mute button | one leg | **GPIO32** | other leg → GND |
+| TTP223 | VCC | **3.3V** | |
+| TTP223 | GND | `GND` | |
+| TTP223 | I/O | **GPIO33** | touch reads HIGH. GPIO32 is also accepted |
 
 ---
 
-## C) Network (`firmware/shared/network.h`)
+## C) Network
 
-Permanent ESP↔ESP LAN — **laptop gateway not required**.  
-Dono W5500 **same switch** pe (ya direct cable). Laptop optional debug ke liye switch pe.
+Pages and the HTTP API are `http://<ip>:5005`. UDP status uses the same port number. The hotspot stays up in every mode.
 
-| Device | IP | UDP |
-|--------|-----|-----|
-| Tank ESP32-S3 | `192.168.50.50` | sends → `192.168.50.51:5005` |
-| Alarm DevKit | `192.168.50.51` | listens **5005** |
-| Subnet | `255.255.255.0` | |
+| Device | Hotspot | Hotspot IP | LAN fallback if DHCP fails |
+|--------|---------|------------|----------------------------|
+| Tank | `tank` | `192.168.4.1` | `192.168.50.50` |
+| Alarm | `alarm` | `192.168.5.1` | `192.168.50.51` |
+
+Programmed LAN MACs are `02:54:41:4E:4B:01` (tank) and `02:41:4C:52:4D:01` (alarm). DHCP on a `10.x` or `192.168.x` network is accepted. LAN mode is the only mode that asks the cable for an address. Wi-Fi mode and hotspot mode leave the W5500 idle.
 
 ---
 
@@ -90,6 +98,7 @@ Dono W5500 **same switch** pe (ya direct cable). Laptop optional debug ke liye s
 ### ESP32-S3 (tank)
 | GPIO | Function |
 |------|----------|
+| 4 | Level sensor, HIGH = wet |
 | 6 | Ultrasonic Trig |
 | 7 | Ultrasonic Echo (divided) |
 | 10 | W5500 CS |
@@ -110,6 +119,7 @@ Dono W5500 **same switch** pe (ya direct cable). Laptop optional debug ke liye s
 | 21 | OLED SDA |
 | 22 | OLED SCL |
 | 23 | W5500 MOSI |
-| 26 | Buzzer |
+| 26 | Buzzer I/O, active low |
 | 27 | Relay |
-| 32 | Mute button |
+| 32 | Extra touch input, HIGH = pressed |
+| 33 | TTP223 touch |

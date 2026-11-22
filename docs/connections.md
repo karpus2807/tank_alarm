@@ -78,7 +78,18 @@ JSN Echo/TX ──┬── 2.2kΩ ──► GPIO7
 
 **UART mode (RX/TX) abhi mat use karo.** Current firmware Trig + `pulseIn(Echo)` pe hai.
 
-Probe mounting: tank **top lid**, water surface facing. `TANK_EMPTY_CM` / `TANK_FULL_CM` calibrate karna.
+Probe mounting: tank **top lid**, water surface facing. Empty distance is about **140 cm** and full distance is about **25 cm**. Set both on the tank page, then calibrate with the current fill percent. Do not reflash to change them.
+
+### Level sensor (separate from percent)
+
+| Wire | ESP32-S3 |
+|------|----------|
+| brown | 5V |
+| blue | GND |
+| yellow | GPIO4, `INPUT_PULLDOWN`, HIGH = water |
+| black | leave open |
+
+A wet sensor shows `1` under the percent. It does not force the percent to 100.
 
 ---
 
@@ -106,7 +117,7 @@ Probe mounting: tank **top lid**, water surface facing. `TANK_EMPTY_CM` / `TANK_
 | VCC   | 5V or 3.3V |
 | RJ45  | LAN switch / router |
 
-### OLED 0.91" I2C (SSD1306 128×32)
+### OLED 1.3" I2C (SH1106 128×64)
 
 | OLED | ESP32 |
 |------|-------|
@@ -115,30 +126,34 @@ Probe mounting: tank **top lid**, water surface facing. `TANK_EMPTY_CM` / `TANK_
 | SDA | GPIO21 |
 | SCL | GPIO22 |
 
-I2C address usually `0x3C`.
+Text is rotated 90 degrees. The tank graphic keeps its neck on the right. The waiting screen prints the IP horizontally because a full address does not fit rotated.
 
-### Buzzer / old alarm relay
+### Buzzer, relay, touch
 
 | Device | ESP32 | Note |
 |--------|-------|------|
-| Active buzzer `+` | GPIO26 | via transistor if > few mA |
-| Active buzzer `-` | GND | |
-| Relay `IN` | GPIO27 | optional: short old alarm 2 pins |
+| Buzzer VCC / GND | module supply / GND | 3-pin module |
+| Buzzer I/O | GPIO26 | LOW = sound, HIGH = quiet |
+| Relay `IN` | GPIO27 | HIGH during an unmuted 80/90/95/level alarm |
 | Relay `VCC`/`GND` | 5V / GND | |
+| TTP223 VCC | 3.3V | |
+| TTP223 GND | GND | |
+| TTP223 I/O | GPIO33 | touch reads HIGH. GPIO32 is also accepted |
 
-Mute button (optional): **GPIO32** to GND with INPUT_PULLUP.
+Hold the touch for 2 seconds to mute or unmute.
 
 ---
 
-## 3) Network (static IP — edit `config.h`)
+## 3) Network
 
-| Device | Example IP | Port |
-|--------|------------|------|
-| Tank node | `192.168.1.50` | UDP send → alarm |
-| Alarm node | `192.168.1.51` | UDP listen `5005` |
-| Gateway / DNS | tumhare router ke mutabiq | |
+Open `http://<ip>:5005`. The hotspot stays up even after a mode is saved.
 
-Dono same subnet / same LAN switch pe.
+| Device | Hotspot | Hotspot page | LAN fallback |
+|--------|---------|--------------|--------------|
+| Tank | `tank` | `http://192.168.4.1:5005` | `192.168.50.50` |
+| Alarm | `alarm` | `http://192.168.5.1:5005` | `192.168.50.51` |
+
+LAN mode uses DHCP first, including a `10.x` network, and falls back after 30 seconds. Wi-Fi mode and hotspot mode do not start the W5500. Both boards must be on the same network only when that is the saved data path: both LAN, both Wi-Fi, or alarm joined to the tank hotspot. HTTP routes are in [api.md](api.md).
 
 ---
 

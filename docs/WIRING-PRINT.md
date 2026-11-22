@@ -39,12 +39,13 @@
 | 5 | USB 5V supply | Tank | Charger / power bank |
 | 6 | ESP32 DevKit V1 | Alarm (ground) | Controller |
 | 7 | W5500 Ethernet module | Alarm | RJ45 → switch |
-| 8 | OLED 0.91" I2C SSD1306 128×32 | Alarm | Display |
-| 9 | Active buzzer | Alarm | Optional |
-| 10 | Relay module | Alarm | Optional (old siren) |
-| 11 | Mute push-button | Alarm | Optional |
+| 8 | OLED 1.3" I2C SH1106 128×64 | Alarm | Display, 3.3V |
+| 9 | 3-pin active buzzer | Alarm | I/O LOW = sound |
+| 10 | Relay module | Alarm | HIGH on GPIO27 during high alarm |
+| 11 | TTP223 touch | Alarm | I/O to GPIO33, 2 second mute |
 | 12 | USB 5V supply | Alarm | Charger / adapter |
-| 13 | LAN switch + 2× CAT6 | Shared | Same LAN / subnet |
+| 13 | Pipe level sensor | Tank | Yellow to GPIO4, HIGH = wet |
+| 14 | LAN switch + CAT6 | Where a LAN mode is used | Same network for both boards |
 
 ---
 
@@ -99,12 +100,24 @@ JSN Echo/TX ──── 2.2 kΩ ────┬──── GPIO7
 | Echo/TX | 2.2 kΩ series | GPIO7 |
 | GPIO7 | 3.3 kΩ | GND |
 
-Probe: mount on **tank top lid**, facing water surface.
+Probe: mount on **tank top lid**, facing the water. Empty is about 140 cm. Full is about 25 cm. Calibrate on the tank page.
 
-### 2.4 Tank GPIO quick list
+### 2.4 Level sensor
+
+| Wire | ESP32-S3 | Note |
+|------|----------|------|
+| brown | 5V | supply |
+| blue | GND | common ground |
+| yellow | **GPIO4** | HIGH = water, LOW = dry |
+| black | open | do not connect |
+
+This digit is separate from the ultrasonic percent.
+
+### 2.5 Tank GPIO quick list
 
 | GPIO | Function |
 |------|----------|
+| 4 | Level sensor |
 | 6 | Ultrasonic Trig |
 | 7 | Ultrasonic Echo (divided) |
 | 10 | W5500 CS |
@@ -141,7 +154,7 @@ Probe: mount on **tank top lid**, facing water surface.
 | INT | GPIO16 | Optional (unused in FW) |
 | RJ45 | LAN switch | ✓ |
 
-### 3.3 OLED 0.91" (SSD1306 128×32 I2C)
+### 3.3 OLED 1.3" (SH1106 128×64 I2C)
 
 | OLED pin | Wire to DevKit | Must |
 |----------|----------------|------|
@@ -152,15 +165,17 @@ Probe: mount on **tank top lid**, facing water surface.
 
 I2C address usually **0x3C**.
 
-### 3.4 Buzzer / relay / mute (optional)
+### 3.4 Buzzer / relay / touch
 
 | Device | Pin | Wire to DevKit | Note |
 |--------|-----|----------------|------|
-| Active buzzer + | — | **GPIO26** | Use transistor if high current |
-| Active buzzer − | — | GND | |
-| Relay IN | IN | **GPIO27** | Can short old 2-pin alarm |
+| Buzzer VCC / GND | power | module supply / GND | 3-pin module |
+| Buzzer I/O | I/O | **GPIO26** | LOW = sound |
+| Relay IN | IN | **GPIO27** | HIGH during unmuted high alarm |
 | Relay power | VCC / GND | 5V / GND | |
-| Mute button | one leg | **GPIO32** | Other leg → GND (INPUT_PULLUP) |
+| TTP223 VCC | VCC | **3.3V** | |
+| TTP223 GND | GND | GND | |
+| TTP223 I/O | I/O | **GPIO33** | HIGH while touched. GPIO32 also accepted |
 
 ### 3.5 Alarm GPIO quick list
 
@@ -174,9 +189,10 @@ I2C address usually **0x3C**.
 | 16 | W5500 INT (optional) |
 | 21 | OLED SDA |
 | 22 | OLED SCL |
-| 26 | Buzzer |
+| 26 | Buzzer I/O, active low |
 | 27 | Relay |
-| 32 | Mute button |
+| 32 | Extra touch input |
+| 33 | TTP223 touch |
 
 ---
 
@@ -195,7 +211,7 @@ Firmware pairs by **MAC**, not fixed IP. DHCP preferred; static fallback if DHCP
 | Fallback subnet | `255.255.255.0` |
 | Fallback gateway / DNS | `192.168.50.1` |
 
-Both W5500s must be on the **same switch / same LAN**. Laptop optional (debug only).
+LAN mode is the only mode that uses the W5500. Wi-Fi mode and hotspot mode do not request a cable address. When both boards use LAN, they need the same network. The page is `http://<ip>:5005` on the hotspot and on the mode address. See [api.md](api.md).
 
 ---
 
@@ -223,37 +239,39 @@ Both W5500s must be on the **same switch / same LAN**. Laptop optional (debug on
 - [ ] Alarm: W5500 CS = GPIO4 (not 5/15)
 - [ ] Alarm: OLED VCC = 3.3V, SDA21 / SCL22
 - [ ] Alarm: CAT6 switch → W5500 RJ45
-- [ ] Both boards on same LAN switch
-- [ ] Optional: buzzer GPIO26, relay GPIO27, mute GPIO32
+- [ ] Tank: level sensor yellow → GPIO4, black left open
+- [ ] Alarm: buzzer I/O GPIO26, relay GPIO27, touch GPIO33
+- [ ] LAN mode: both boards on the same network
 
 ---
 
 ## 7. First boot expect
 
-| OLED / Serial | Meaning |
-|---------------|---------|
-| Boot logo `TANK` / `ALARM` | Alarm firmware started |
-| `WAITING` / `SEARCH` | Looking for tank peer |
-| `CONNECTED` (~2 s) | Tank MAC locked |
-| Fuel bars | Live tank % |
-| `DISCONNECTED` | Mid-run link/tank lost |
+No mode is saved yet. Each hotspot is up and no level packets are sent.
 
-Tank serial example: `PEER alarm locked IP=… (MAC match)`  
-Alarm serial example: `eth=1 link=1` → `alarm ready`
+| What you see | Meaning |
+|--------------|---------|
+| Tank page at `http://192.168.4.1:5005` | Tank setup |
+| Alarm page at `http://192.168.5.1:5005` | Alarm setup |
+| Live tank, percent, distance, and 0/1 | Alarm is receiving packets |
+| `DISCONNECTED` | The link was up, then silent for about 25 seconds |
+
+There is no connected splash. Bluetooth shows the page IP.
 
 ---
 
 ## 8. Calibration (after wiring)
 
-Edit `firmware/tank-node/src/config.h` then reflash tank:
+On the tank page, not in `config.h`:
 
-| Constant | Meaning |
-|----------|---------|
-| `TANK_EMPTY_CM` | Distance when tank empty (~150 for 1.5 m) |
-| `TANK_FULL_CM` | Distance when tank full (probe near surface) |
-| `WARN_PERCENT` | Default 90% |
-| `FULL_PERCENT` | Default 95% (alarm) |
+| Field | Meaning |
+|-------|---------|
+| Empty cm | Distance with the tank empty. About 140 |
+| Full cm | Distance with the tank full. About 25, outside the blind zone |
+| Current water % | How full it looks right now |
+
+Save only happens when the sensor is steady and the measured distance is within 25 cm of that percent. Beep levels are also edited on that page.
 
 ---
 
-*Source of truth in code: `firmware/tank-node/src/config.h`, `firmware/alarm-node/src/config.h`, `firmware/shared/network.h`.*
+*Source of truth in code: `firmware/tank-node/src/config.h`, `firmware/alarm-node/src/config.h`, `firmware/shared/app_config.h`, `firmware/shared/network.h`.*
