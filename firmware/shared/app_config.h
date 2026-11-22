@@ -395,7 +395,7 @@ inline String portalPage(bool tank, const Cfg& c, const char* hotspotIp, const c
   s += tank ? "<h2>Tank</h2>" : "<h2>Alarm</h2>";
   s += "<p>Hotspot stays at <b>http://";
   s += hotspotIp;
-  s += ":5005</b> even when the saved Wi-Fi is wrong.<br>Page and API are also on <b>http://";
+  s += ":5005</b> for setup only, even when the saved Wi-Fi is wrong.<br>Page and API are also on <b>http://";
   s += modeIp[0] ? modeIp : hotspotIp;
   s += ":5005</b>. Bluetooth shows that IP, and follows it if the address changes.</p>";
   s += "<pre id=live>waiting</pre>";
@@ -458,8 +458,7 @@ inline String portalPage(bool tank, const Cfg& c, const char* hotspotIp, const c
   s += "<script>async function tick(){try{let j=await (await fetch('/api/status')).json();let t='mode '+j.mode+'\\nIP '+j.ip+'\\nhotspot '+j.ap+'\\n';";
   s += "t+='distance '+(j.cm<0?'--':j.cm+' cm')+'\\nlevel '+(j.pct<0?'--':j.pct+' %')+'\\n';";
   s += "if(j.stable!=null)t+='reading '+(j.stable?'steady':'settling')+'\\n';";
-  s += "if(j.spread!=null)t+='spread '+j.spread+' cm\\n';";
-  s += "if(j.share)t+='hotspot is sharing internet\\n';document.getElementById('live').textContent=t;}catch(e){}}setInterval(tick,2000);tick();";
+  s += "if(j.spread!=null)t+='spread '+j.spread+' cm\\n';document.getElementById('live').textContent=t;}catch(e){}}setInterval(tick,2000);tick();";
   s += "function flashFw(){let f=document.getElementById('fw');let bar=document.getElementById('fwbar');let msg=document.getElementById('fwmsg');";
   s += "if(!f||!f.files[0]){if(msg)msg.textContent='Choose the tank .bin';return;}let xhr=new XMLHttpRequest();xhr.open('POST','/update');";
   s += "xhr.upload.onprogress=function(e){if(!e.lengthComputable)return;let p=Math.round(100*e.loaded/e.total);bar.value=p;msg.textContent='Flashing '+p+'%';};";

@@ -29,7 +29,7 @@ JSON routes send `Access-Control-Allow-Origin: *`. A bad form POST returns the H
   "pct": 64.4,
   "stable": 1,
   "spread": 0.4,
-  "share": 1,
+  "share": 0,
   "lvl": 0,
   "link": 0
 }
@@ -44,8 +44,8 @@ JSON routes send `Access-Control-Allow-Origin: *`. A bad form POST returns the H
 | `pct` | Fill percent from empty and full distance. `-1` if `cm` is missing |
 | `stable` | `1` when recent ultrasonic readings agree. The percent beeps run only while this is `1` |
 | `spread` | Spread of recent readings, centimetres |
-| `share` | `1` when the hotspot is sharing Wi-Fi or LAN internet |
-| `lvl` | Level sensor. `1` means the tank is full. The alarm then sounds continuously until touch mute. This does not change `pct` |
+| `share` | Always `0`. The hotspot is for setup and does not share internet |
+| `lvl` | Level sensor. `1` means full: `pct` is 100 and the alarm sounds continuously until touch mute. `0` leaves `pct` to the ultrasonic reading |
 | `link` | `1` when an alarm packet arrived in the last 20 seconds |
 
 ### `GET /`

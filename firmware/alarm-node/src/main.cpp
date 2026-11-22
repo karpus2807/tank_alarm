@@ -181,6 +181,10 @@ static bool parseStatus(const char* json) {
   tank.fresh = okp ? atoi(okp + 5) != 0 : true;
   const char* lp = strstr(json, "\"lvl\":");
   tank.level = lp && atoi(lp + 6) != 0;
+  if (tank.level) {
+    tank.pct = 100.0f;
+    tank.fresh = true;
+  }
   tank.lastRx = millis();
   remote.lowPct = (uint8_t)constrain(jsonUInt(json, "lo", remote.lowPct), 1, 100);
   remote.midPct = (uint8_t)constrain(jsonUInt(json, "md", remote.midPct), 1, 100);

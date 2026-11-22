@@ -6,7 +6,6 @@
 #include <ETH.h>
 #include <BLEDevice.h>
 #include <Preferences.h>
-extern "C" void ip_napt_enable(uint32_t addr, int enable);
 #include "config.h"
 #include "app_config.h"
 #include "ble_name.h"
@@ -16,14 +15,10 @@ extern "C" void ip_napt_enable(uint32_t addr, int enable);
 
 WebServer server(HTTP_PORT);
 WiFiUDP UdpWifi;
-WiFiUDP dnsSock;
-static bool dnsUp = false;
-static IPAddress dnsUpstream(8, 8, 8, 8);
 
 static Cfg cfg;
 static bool ethStarted = false;
 static bool ethStatic = false;
-static bool naptOn = false;
 static bool wifiUdp = false;
 static bool staUp = false;
 static bool otaOk = false;
@@ -87,16 +82,15 @@ static void startRadio() {
   WiFi.mode(WIFI_AP_STA);
   WiFi.setAutoReconnect(false);
   WiFi.setHostname("tank");
-  WiFi.softAPConfig(TANK_AP_IP, TANK_AP_IP, AP_MASK, IPAddress(192, 168, 4, 2), IPAddress(8, 8, 8, 8));
+  WiFi.softAPConfig(TANK_AP_IP, TANK_AP_IP, AP_MASK);
   ipToBuf(TANK_AP_IP, ipBuf, sizeof(ipBuf));
   if (!WiFi.softAP(TANK_SSID, LINK_PASS, 6)) LOGLN("AP failed");
   if (!wifiUdp) {
     UdpWifi.begin(GROUP_PORT);
     wifiUdp = true;
   }
-  if (!dnsUp && dnsSock.begin(53)) dnsUp = true;
   staTry = millis();
-  LOG("hotspot %s %s\n", TANK_SSID, ipBuf);
+  LOG("hotspot %s %s setup only\n", TANK_SSID, ipBuf);
 }
 
 static void keepHotspot() {
@@ -109,81 +103,9 @@ static void keepHotspot() {
   if (apUp) return;
   WiFi.mode(WIFI_AP_STA);
   WiFi.setAutoReconnect(false);
-  WiFi.softAPConfig(TANK_AP_IP, TANK_AP_IP, AP_MASK, IPAddress(192, 168, 4, 2), IPAddress(8, 8, 8, 8));
-  if (WiFi.softAP(TANK_SSID, LINK_PASS, 6)) {
-    naptOn = false;
-    LOGLN("hotspot restored 192.168.4.1");
-  } else LOGLN("AP failed");
-}
-
-static void stopShare() {
-  if (!naptOn) return;
-  WiFi.AP.enableNAPT(false);
-  if (WiFi.softAPIP()[0]) ip_napt_enable((uint32_t)WiFi.softAPIP(), 0);
-  naptOn = false;
-  LOGLN("internet share off");
-}
-
-static void startShare(IPAddress dns, IPAddress gw, bool ethWan, bool ipChanged) {
-  if (!gw[0] || !WiFi.softAPIP()[0]) return;
-  if (dns[0]) dnsUpstream = dns;
-  if (ipChanged || !naptOn) {
-    const bool def = ethWan ? ETH.setDefault() : WiFi.STA.setDefault();
-    LOG("uplink gw %s default %s\n", gw.toString().c_str(), def ? "ok" : "fail");
-  }
-  if (naptOn) return;
-  const bool ok = WiFi.AP.enableNAPT(true);
-  ip_napt_enable((uint32_t)WiFi.softAPIP(), 1);
-  naptOn = true;
-  LOG("internet shared %s via %s\n", ok ? "on" : "direct", gw.toString().c_str());
-}
-
-struct DnsWait {
-  uint16_t id;
-  IPAddress to;
-  uint16_t port;
-  uint32_t at;
-};
-static DnsWait dnsWait[4];
-
-static void serviceDns() {
-  if (!dnsUp || !naptOn) return;
-  for (int npack = 0; npack < 4; npack++) {
-    int n = dnsSock.parsePacket();
-    if (n <= 0) return;
-    uint8_t buf[512];
-    if (n > (int)sizeof(buf)) n = sizeof(buf);
-    int len = dnsSock.read(buf, n);
-    if (len < 12) continue;
-    const IPAddress from = dnsSock.remoteIP();
-    const uint16_t id = ((uint16_t)buf[0] << 8) | buf[1];
-    if (from == dnsUpstream) {
-      for (int i = 0; i < 4; i++) {
-        if (!dnsWait[i].at || dnsWait[i].id != id) continue;
-        if (dnsSock.beginPacket(dnsWait[i].to, dnsWait[i].port)) {
-          dnsSock.write(buf, len);
-          dnsSock.endPacket();
-        }
-        dnsWait[i].at = 0;
-      }
-      continue;
-    }
-    int slot = 0;
-    for (int i = 0; i < 4; i++) {
-      if (!dnsWait[i].at || millis() - dnsWait[i].at > 3000) {
-        slot = i;
-        break;
-      }
-    }
-    dnsWait[slot].id = id;
-    dnsWait[slot].to = from;
-    dnsWait[slot].port = dnsSock.remotePort();
-    dnsWait[slot].at = millis();
-    if (dnsSock.beginPacket(dnsUpstream, 53)) {
-      dnsSock.write(buf, len);
-      dnsSock.endPacket();
-    }
-  }
+  WiFi.softAPConfig(TANK_AP_IP, TANK_AP_IP, AP_MASK);
+  if (WiFi.softAP(TANK_SSID, LINK_PASS, 6)) LOGLN("hotspot restored 192.168.4.1");
+  else LOGLN("AP failed");
 }
 
 static IPAddress staIp(0, 0, 0, 0);
@@ -197,13 +119,11 @@ static void serviceSta() {
     if (!staUp || changed) LOG("home ip %s\n", now.toString().c_str());
     staIp = now;
     staUp = true;
-    startShare(WiFi.dnsIP(), WiFi.gatewayIP(), false, changed);
     return;
   }
   if (staUp || staIp[0]) {
     staUp = false;
     staIp = IPAddress((uint32_t)0);
-    stopShare();
   }
   if (WiFi.status() == WL_IDLE_STATUS) return;
   const uint32_t wait = staBegun ? 45000 : 5000;
@@ -234,7 +154,6 @@ static void serviceEth() {
       ethStatic = false;
     }
     noteLanIp(IPAddress((uint32_t)0));
-    stopShare();
     dhcpStart = millis();
     return;
   }
@@ -248,12 +167,9 @@ static void serviceEth() {
   }
   if (!now[0]) {
     noteLanIp(IPAddress((uint32_t)0));
-    stopShare();
     return;
   }
-  const bool changed = now != ethIp;
   noteLanIp(now);
-  startShare(ETH.dnsIP(), ETH.gatewayIP(), true, changed);
 }
 
 static float distanceToPercent(float cm) {
@@ -264,10 +180,20 @@ static float distanceToPercent(float cm) {
   return pct;
 }
 
+static float reportedPercent() {
+  if (levelWet) return 100.0f;
+  return distanceToPercent(smoothCm);
+}
+
+static bool reportedOk() {
+  if (levelWet) return true;
+  return readingStable && !isnan(smoothCm);
+}
+
 static String statusJson() {
   chosenIps();
   const float cm = smoothCm;
-  const float pct = distanceToPercent(cm);
+  const float pct = reportedPercent();
   String s = "{\"role\":\"tank\",\"mode\":\"";
   s += modeName(cfg.mode);
   s += "\",\"ap\":\"";
@@ -282,8 +208,7 @@ static String statusJson() {
   s += readingStable ? "1" : "0";
   s += ",\"spread\":";
   s += String(spreadCm, 1);
-  s += ",\"share\":";
-  s += naptOn ? "1" : "0";
+  s += ",\"share\":0";
   s += ",\"lvl\":";
   s += levelWet ? "1" : "0";
   s += ",\"link\":";
@@ -788,9 +713,7 @@ void loop() {
   keepHotspot();
   if (cfg.mode == MODE_WIFI) serviceSta();
   else if (cfg.mode == MODE_LAN) serviceEth();
-  else stopShare();
   server.handleClient();
-  serviceDns();
   pollUdp();
   levelWet = levelIsWet(now);
   if (now - lastSample >= 900) {
@@ -799,8 +722,7 @@ void loop() {
   }
   if (cfg.mode != MODE_NONE && (lastSend == 0 || now - lastSend >= SEND_MS)) {
     lastSend = now;
-    const float pct = distanceToPercent(smoothCm);
-    sendStatus(smoothCm, pct, readingStable && !isnan(smoothCm));
+    sendStatus(smoothCm, reportedPercent(), reportedOk());
   }
   blePublishIp(bleIp());
   if (rebootAt && (int32_t)(now - rebootAt) >= 0) ESP.restart();

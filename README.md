@@ -33,7 +33,7 @@ Save a mode on the page and the board reboots into it.
 | LAN | W5500 DHCP, then `192.168.50.50` if DHCP does not answer in 30 seconds |
 | Hotspot | Alarm joins `tank` |
 
-The alarm page is LAN or Wi-Fi only. A wrong Wi-Fi password does not close the hotspot. When Wi-Fi or LAN gets a gateway, the tank hotspot shares that internet.
+The alarm page is LAN or Wi-Fi only. A wrong Wi-Fi password does not close the hotspot. The hotspot is only for setup. It does not share LAN or Wi-Fi internet.
 
 Level packets are UDP JSON on port **5005**. The alarm beeps from the tank percent. It stays quiet while the tank marks the reading unsteady.
 
@@ -53,6 +53,6 @@ The tank page can also flash `firmware/tank-node/.pio/build/tank-s3/firmware.bin
 
 ## Level
 
-The ultrasonic sensor faces the water from the lid. A higher level is a shorter distance. Percent is `(empty − distance) / (empty − full) × 100`. For this tank, empty is about **140 cm** and full is about **25 cm**. Set them on the tank page, then calibrate with the current fill percent. The level sensor on GPIO4 is a separate wet/dry digit and does not force the percent to 100.
+The ultrasonic sensor faces the water from the lid. A higher level is a shorter distance. Percent is `(empty − distance) / (empty − full) × 100`. For this tank, empty is about **140 cm** and full is about **25 cm**. Set them on the tank page, then calibrate with the current fill percent. The level sensor on GPIO4 is wet or dry only. When it reads wet, the percent is shown as 100 and the buzzer stays on until touch mute. The ultrasonic distance is still shown beside that.
 
 Default beeps, edited on the tank page: 10% two short beeps five times, 80% two short beeps once, 90% three short beeps once, 95% a long beep until mute, and a solid beep while the level sensor is wet. Hold the alarm touch sensor for 2 seconds to mute or unmute.

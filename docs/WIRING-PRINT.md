@@ -111,7 +111,7 @@ Probe: mount on **tank top lid**, facing the water. Empty is about 140 cm. Full 
 | yellow | **GPIO4** | HIGH = water, LOW = dry |
 | black | open | do not connect |
 
-This digit is separate from the ultrasonic percent.
+Wet reads `1` and the shown percent becomes 100. Dry leaves the percent to the ultrasonic sensor.
 
 ### 2.5 Tank GPIO quick list
 

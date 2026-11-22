@@ -89,7 +89,7 @@ Probe mounting: tank **top lid**, water surface facing. Empty distance is about 
 | yellow | GPIO4, `INPUT_PULLDOWN`, HIGH = water |
 | black | leave open |
 
-A wet sensor shows `1` under the percent. It does not force the percent to 100.
+A wet sensor shows `1` under the percent and the percent becomes 100 until the sensor reads dry.
 
 ---
 
