@@ -27,14 +27,24 @@ static bool ethUdpReady = false;
 static bool wifiUdpReady = false;
 static bool ethHwReady = false;
 static bool staJoined = false;
+static bool apOnlyFallback = false;
 static uint32_t dhcpStartMs = 0;
 static uint32_t dhcpTryAt = 0;
 static uint32_t staTryAt = 0;
+static uint32_t staFailSince = 0;
 static bool peerOnWifi = false;
 static bool reenterMode = false;
 static WlanCreds wlan{};
 static char consoleLine[128];
 static uint8_t consoleLen = 0;
+
+// Home STA association can disrupt SoftAP on ESP32. After this long without a
+// home association, drop STA and stay AP-only so TankAlarmLink stays reachable.
+static const uint32_t STA_GIVE_UP_MS = 45000;
+// While in AP-only fallback, periodically retry home Wi-Fi.
+static const uint32_t STA_RETRY_HOME_MS = 120000;
+// Re-assert SoftAP while still attempting STA (failed associates can kill AP).
+static const uint32_t STA_REASSERT_MS = 20000;
 
 static void startEthHardware() {
   pinMode(PIN_ETH_CS, OUTPUT);
@@ -82,25 +92,42 @@ static bool sendWifi(IPAddress dest, const char* buf) {
   return UdpWifi.endPacket() == 1;
 }
 
-static void ensureAp() {
-  if (wifiUdpReady) return;
+static bool startSoftAp(bool withSta) {
   WiFi.persistent(false);
   WiFi.setSleep(false);
-  WiFi.mode(wlan.ok ? WIFI_AP_STA : WIFI_AP);
+  WiFi.mode(withSta ? WIFI_AP_STA : WIFI_AP);
   WiFi.softAPConfig(TANK_AP_IP, TANK_AP_IP, TANK_AP_MASK);
   if (!WiFi.softAP(TANK_AP_SSID, TANK_AP_PASS, 6)) {
     LOGLN("AP failed");
-    return;
+    return false;
   }
+  return true;
+}
+
+static void enterApOnlyFallback(const char* reason) {
+  apOnlyFallback = true;
+  staJoined = false;
+  staFailSince = 0;
+  WiFi.disconnect(false);
+  if (!startSoftAp(false)) return;
+  staTryAt = millis();
+  LOG("home wifi failed (%s); AP-only fallback %s\n", reason, TANK_AP_SSID);
+}
+
+static void ensureAp() {
+  if (wifiUdpReady) return;
+  const bool tryHome = wlan.ok && !apOnlyFallback;
+  if (!startSoftAp(tryHome)) return;
   UdpWifi.begin(GROUP_PORT);
   wifiUdpReady = true;
   uint8_t apmac[6];
   WiFi.softAPmacAddress(apmac);
   macToHex(apmac, myMacHex);
   LOG("AP up %s mac=%s\n", TANK_AP_SSID, myMacHex);
-  if (wlan.ok) {
+  if (tryHome) {
     WiFi.begin(wlan.ssid, wlan.pass);
     staTryAt = millis();
+    staFailSince = millis();
     LOG("also joining home %s\n", wlan.ssid);
   }
 }
@@ -113,8 +140,9 @@ static void onConsoleLine(char* line) {
     return;
   }
   if (strcasecmp(line, "MODE") == 0) {
-    LOG("eth=%d wifi=%d peer=%s\n", ethUdpReady ? 1 : 0, wifiUdpReady ? 1 : 0,
-        alarmPeerSeen ? alarmPeer.toString().c_str() : "none");
+    LOG("eth=%d wifi=%d peer=%s home=%s\n", ethUdpReady ? 1 : 0, wifiUdpReady ? 1 : 0,
+        alarmPeerSeen ? alarmPeer.toString().c_str() : "none",
+        !wlan.ok ? "none" : (staJoined ? "up" : (apOnlyFallback ? "ap-fallback" : "trying")));
     if (ethUdpReady) LOG("lan ip=%s\n", Ethernet.localIP().toString().c_str());
     if (wifiUdpReady) LOG("ap ip=%s\n", WiFi.softAPIP().toString().c_str());
     return;
@@ -177,18 +205,48 @@ static void serviceEth() {
 
 static void serviceSta() {
   if (!wlan.ok || !wifiUdpReady) return;
+
   if (WiFi.status() == WL_CONNECTED) {
     if (!staJoined) {
       staJoined = true;
+      apOnlyFallback = false;
+      staFailSince = 0;
       LOG("home wifi ip=%s\n", WiFi.localIP().toString().c_str());
     }
     return;
   }
+
   if (staJoined) staJoined = false;
-  if (WiFi.status() == WL_IDLE_STATUS) return;
-  if (millis() - staTryAt < 20000) return;
+
+  // AP-only recovery: SoftAP stays up; periodically retry home STA.
+  if (apOnlyFallback) {
+    if (millis() - staTryAt < STA_RETRY_HOME_MS) return;
+    apOnlyFallback = false;
+    staFailSince = millis();
+    staTryAt = millis();
+    if (!startSoftAp(true)) {
+      enterApOnlyFallback("reassert");
+      return;
+    }
+    WiFi.begin(wlan.ssid, wlan.pass);
+    LOG("retry home %s\n", wlan.ssid);
+    return;
+  }
+
+  if (staFailSince == 0) staFailSince = millis();
+
+  // Prolonged home failure → drop STA so the hotspot stays usable.
+  if (millis() - staFailSince >= STA_GIVE_UP_MS) {
+    enterApOnlyFallback("timeout");
+    return;
+  }
+
+  if (millis() - staTryAt < STA_REASSERT_MS) return;
   staTryAt = millis();
-  WiFi.reconnect();
+  // Re-assert SoftAP before reconnect; failed STA associates often take AP down.
+  WiFi.softAPConfig(TANK_AP_IP, TANK_AP_IP, TANK_AP_MASK);
+  WiFi.softAP(TANK_AP_SSID, TANK_AP_PASS, 6);
+  if (WiFi.status() != WL_IDLE_STATUS) WiFi.reconnect();
 }
 
 static void serviceNet() {
@@ -197,14 +255,16 @@ static void serviceNet() {
     reenterMode = false;
     wlan = loadWlan();
     staJoined = false;
+    apOnlyFallback = false;
+    staFailSince = 0;
     if (wifiUdpReady && wlan.ok) {
-      WiFi.mode(WIFI_AP_STA);
-      WiFi.softAP(TANK_AP_SSID, TANK_AP_PASS, 6);
+      if (!startSoftAp(true)) return;
       WiFi.begin(wlan.ssid, wlan.pass);
       staTryAt = millis();
+      staFailSince = millis();
+      LOG("WLAN updated; joining home %s\n", wlan.ssid);
     } else if (wifiUdpReady) {
-      WiFi.mode(WIFI_AP);
-      WiFi.softAP(TANK_AP_SSID, TANK_AP_PASS, 6);
+      startSoftAp(false);
     }
   }
   ensureAp();

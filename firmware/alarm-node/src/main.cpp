@@ -56,6 +56,11 @@ static bool reenterMode = false;
 static WlanCreds wlan{};
 static char consoleLine[128];
 static uint8_t consoleLen = 0;
+
+// When a saved home profile will not associate, fall back to the tank hotspot
+// so the link (and OLED / peer path over TankAlarmLink) stays reachable.
+static const uint32_t HOME_CONNECT_TIMEOUT_MS = 30000;
+static const uint32_t HOME_RETRY_MS = 120000;
 static bool muted = false;
 static bool peerLocked = false;
 static bool everConnected = false;
@@ -305,15 +310,38 @@ static void serviceEth() {
 }
 
 static void serviceWifi() {
-  if (wifiBeginAt == 0) joinWifi(false);
+  // Prefer saved home Wi-Fi when present; otherwise join the tank SoftAP.
+  if (wifiBeginAt == 0) joinWifi(wlan.ok);
 
   if (WiFi.status() == WL_CONNECTED) {
     wifiDownSince = 0;
     if (!wifiUdpReady) {
       UdpWifi.begin(GROUP_PORT);
       wifiUdpReady = true;
-      Serial.printf("wifi ip=%s\n", WiFi.localIP().toString().c_str());
+      Serial.printf("wifi ip=%s (%s)\n", WiFi.localIP().toString().c_str(),
+                    appliedHome ? "home" : "tank-ap");
     }
+    return;
+  }
+
+  // Connection lost after being up: restart fail/retry clocks so a brief
+  // blip does not instantly force tank-AP fallback.
+  if (wifiUdpReady) {
+    wifiBeginAt = millis();
+    wifiUdpReady = false;
+  }
+
+  // Saved home profile will not associate → fall back to tank hotspot.
+  if (appliedHome && (millis() - wifiBeginAt) >= HOME_CONNECT_TIMEOUT_MS) {
+    Serial.println("home wifi failed; joining tank AP");
+    joinWifi(false);
+    return;
+  }
+
+  // On tank AP with saved credentials, periodically retry home.
+  if (!appliedHome && wlan.ok && (millis() - wifiBeginAt) >= HOME_RETRY_MS) {
+    Serial.println("retry home wifi");
+    joinWifi(true);
     return;
   }
 
@@ -332,6 +360,8 @@ static void serviceNet() {
     reenterMode = false;
     wlan = loadWlan();
     wifiBeginAt = 0;
+    wifiDownSince = 0;
+    wifiUdpReady = false;
   }
   serviceWifi();
   serviceEth();
@@ -557,7 +587,7 @@ void setup() {
   u8g2.begin();
   drawBootLogo();
 
-  joinWifi(false);
+  joinWifi(wlan.ok);
   uiMode = UI_WAITING;
   drawStatusScreen(oledWord(), true);
   Serial.println("alarm ready");
