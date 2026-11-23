@@ -140,6 +140,10 @@ Same shape as the tank. Used to pick a network to join.
 
 Success reboots. Alarm cannot be saved as `ap`.
 
+### `POST /update`
+
+Same upload as the tank. The file is the alarm application image `alarm-firmware.bin`, not a full flash dump. `200` and `ok` mean it finished and the board reboots.
+
 ### `POST /reset`
 
 Clears saved settings and reboots to the alarm hotspot.

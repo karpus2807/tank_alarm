@@ -49,7 +49,7 @@ pio run -t upload
 
 Tank upload port is `/dev/ttyACM0`. Alarm upload port is `/dev/ttyUSB0`.
 
-The tank page can also flash `firmware/tank-node/.pio/build/tank-s3/firmware.bin` with **Firmware update**. That file is the application image, not a full flash dump.
+Each page can flash its own application image with **Firmware update**. Those files are `tank-firmware.bin` and `alarm-firmware.bin` in the project folder. They are not full flash dumps. The first alarm image that adds this page still has to be written over USB, because it also changes the flash layout.
 
 ## Level
 

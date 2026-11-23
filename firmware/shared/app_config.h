@@ -385,7 +385,8 @@ inline String patRow(const char* title, const char* prefix, uint8_t pct, const c
   return s;
 }
 
-inline String portalPage(bool tank, const Cfg& c, const char* hotspotIp, const char* modeIp, const char* err) {
+inline String portalPage(bool tank, const Cfg& c, const char* hotspotIp, const char* modeIp, const char* err,
+                          int buzzMode = 0, int relayMode = 0, int relayHigh = 1) {
   String s;
   s.reserve(9800);
   s += "<!doctype html><html><head><meta name=viewport content='width=device-width,initial-scale=1'>";
@@ -443,7 +444,7 @@ inline String portalPage(bool tank, const Cfg& c, const char* hotspotIp, const c
   s += "<p><button type=submit>Save and reboot</button></p></form>";
   if (tank) {
     s += "<h3>Ultrasonic calibration</h3>";
-    s += "<p>Sensor is on top of a 140 cm tank. Empty cm is about 140. Full cm is often 20 to 30. Current % is how full the tank looks right now. Calibration measures for a few seconds and saves only when every reading stays within 1.5 cm. A jumping sensor is rejected.</p>";
+    s += "<p>Sensor is on top of a 140 cm tank. Empty cm is about 140. Full cm is often 20 to 30. Current % is how full the tank looks right now. Calibration measures for a few seconds and saves only when every reading stays within 1.5 cm. No echo, or a jumping sensor, is rejected. The level sensor is not used here.</p>";
     s += "<form method=POST action=/calibrate>Empty cm <input name=cempty value='";
     s += String(c.emptyCm, 1);
     s += "'> Full cm <input name=cfull value='";
@@ -453,14 +454,40 @@ inline String portalPage(bool tank, const Cfg& c, const char* hotspotIp, const c
     s += "<p>Choose the tank firmware .bin. Flash works on the LAN IP and on the hotspot. Progress shows here. The board reboots when the write finishes.</p>";
     s += "<input id=fw type=file accept=.bin> <button type=button onclick='flashFw()'>Flash</button>";
     s += "<br><progress id=fwbar max=100 value=0 style='width:16em'></progress> <span id=fwmsg></span>";
+  } else {
+    s += "<h3>Output test</h3>";
+    s += "<p>These buttons hold the output for a wiring test. Follow alarm gives control back. A 2 second touch mutes the buzzer and the relay.</p>";
+    s += "<p>Buzzer is ";
+    s += buzzMode == 1 ? "manual on" : buzzMode == 2 ? "manual off" : "following the alarm";
+    s += "<br><form style='display:inline' method=POST action=/test><input type=hidden name=act value=buzzon><button>Buzzer on</button></form> ";
+    s += "<form style='display:inline' method=POST action=/test><input type=hidden name=act value=buzzoff><button>Buzzer off</button></form></p>";
+    s += "<p>Relay is ";
+    s += relayMode == 1 ? "manual on" : relayMode == 2 ? "manual off" : "following the alarm";
+    s += "<br><form style='display:inline' method=POST action=/test><input type=hidden name=act value=relayon><button>Relay on</button></form> ";
+    s += "<form style='display:inline' method=POST action=/test><input type=hidden name=act value=relayoff><button>Relay off</button></form></p>";
+    s += "<p>Relay trigger is ";
+    s += relayHigh ? "active HIGH" : "active LOW";
+    s += "<br><form style='display:inline' method=POST action=/test><input type=hidden name=act value=rlyhigh><button>Active HIGH</button></form> ";
+    s += "<form style='display:inline' method=POST action=/test><input type=hidden name=act value=rlylow><button>Active LOW</button></form></p>";
+    s += "<form method=POST action=/test><input type=hidden name=act value=auto><button>Follow alarm</button></form>";
+    s += "<h3>Firmware update</h3>";
+    s += "<p>Choose the alarm firmware .bin. Flash works on the LAN IP and on the hotspot. Progress shows here. The board reboots when the write finishes.</p>";
+    s += "<input id=fw type=file accept=.bin> <button type=button onclick='flashFw()'>Flash</button>";
+    s += "<br><progress id=fwbar max=100 value=0 style='width:16em'></progress> <span id=fwmsg></span>";
   }
   s += "<form method=POST action=/reset><button type=submit>Factory reset</button></form>";
   s += "<script>async function tick(){try{let j=await (await fetch('/api/status')).json();let t='mode '+j.mode+'\\nIP '+j.ip+'\\nhotspot '+j.ap+'\\n';";
-  s += "t+='distance '+(j.cm<0?'--':j.cm+' cm')+'\\nlevel '+(j.pct<0?'--':j.pct+' %')+'\\n';";
+  s += "t+='distance '+(j.cm<0?'--':j.cm+' cm')+'\\n';";
+  s += "if(j.raw!=null)t+='raw '+(j.raw<0?'no echo':j.raw+' cm')+'\\n';";
+  s += "t+='level '+(j.pct<0?'--':j.pct+' %')+'\\n';";
+  s += "if(j.lvl!=null)t+='level sensor '+j.lvl+'\\n';";
+  s += "if(j.temp!=null && j.temp>=0)t+='board '+j.temp+' C\\n';";
+  s += "if(j.buzz!=null)t+='buzzer '+(j.buzz==1?'manual on':j.buzz==2?'manual off':'alarm')+'\\n';";
+  s += "if(j.relay!=null)t+='relay '+(j.relay==1?'manual on':j.relay==2?'manual off':'alarm')+' trigger '+(j.rlyh?'HIGH':'LOW')+'\\n';";
   s += "if(j.stable!=null)t+='reading '+(j.stable?'steady':'settling')+'\\n';";
   s += "if(j.spread!=null)t+='spread '+j.spread+' cm\\n';document.getElementById('live').textContent=t;}catch(e){}}setInterval(tick,2000);tick();";
   s += "function flashFw(){let f=document.getElementById('fw');let bar=document.getElementById('fwbar');let msg=document.getElementById('fwmsg');";
-  s += "if(!f||!f.files[0]){if(msg)msg.textContent='Choose the tank .bin';return;}let xhr=new XMLHttpRequest();xhr.open('POST','/update');";
+  s += "if(!f||!f.files[0]){if(msg)msg.textContent='Choose the .bin';return;}let xhr=new XMLHttpRequest();xhr.open('POST','/update');";
   s += "xhr.upload.onprogress=function(e){if(!e.lengthComputable)return;let p=Math.round(100*e.loaded/e.total);bar.value=p;msg.textContent='Flashing '+p+'%';};";
   s += "xhr.onload=function(){if(xhr.status==200){bar.value=100;msg.textContent='Flashed. Rebooting.';setTimeout(function(){location.reload();},8000);}else msg.textContent='Flash failed';};";
   s += "xhr.onerror=function(){msg.textContent='Link dropped. If it rebooted, open the page again.';};let body=new FormData();body.append('firmware',f.files[0],f.files[0].name);xhr.send(body);};";

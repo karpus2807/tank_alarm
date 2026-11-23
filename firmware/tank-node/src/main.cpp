@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <driver/temperature_sensor.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <WebServer.h>
@@ -35,6 +36,7 @@ static float distRing[DIST_RING];
 static uint8_t distN = 0;
 static uint8_t distI = 0;
 static float smoothCm = NAN;
+static float rawCm = NAN;
 static float spreadCm = 0;
 static bool readingStable = false;
 static uint32_t tightSince = 0;
@@ -42,6 +44,23 @@ static uint32_t lastAccept = 0;
 static float outAnchor = NAN;
 static uint8_t outRun = 0;
 static bool levelWet = false;
+static float boardC = NAN;
+
+static void sampleBoardTemp() {
+  static temperature_sensor_handle_t sensor = nullptr;
+  static bool broken = false;
+  if (broken) return;
+  if (!sensor) {
+    temperature_sensor_config_t cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(-10, 80);
+    if (temperature_sensor_install(&cfg, &sensor) != ESP_OK || temperature_sensor_enable(sensor) != ESP_OK) {
+      broken = true;
+      sensor = nullptr;
+      return;
+    }
+  }
+  float c = 0;
+  if (temperature_sensor_get_celsius(sensor, &c) == ESP_OK) boardC = c;
+}
 
 static char ipBuf[16];
 static char modeIpBuf[16];
@@ -202,6 +221,8 @@ static String statusJson() {
   s += modeIpBuf;
   s += "\",\"cm\":";
   s += isnan(cm) ? "-1" : String(cm, 1);
+  s += ",\"raw\":";
+  s += isnan(rawCm) ? "-1" : String(rawCm, 1);
   s += ",\"pct\":";
   s += isnan(pct) ? "-1" : String(pct, 1);
   s += ",\"stable\":";
@@ -213,6 +234,8 @@ static String statusJson() {
   s += levelWet ? "1" : "0";
   s += ",\"link\":";
   s += (alarmSeen && millis() - alarmSeen < 20000) ? "1" : "0";
+  s += ",\"temp\":";
+  s += isnan(boardC) ? "-1" : String(boardC, 1);
   s += "}";
   return s;
 }
@@ -547,14 +570,14 @@ static void sendStatus(float cm, float pct, bool ok) {
   }
 }
 
-// JSN-SR04T blind zone is about 25 cm. Closer echoes are the probe ringing, not water.
-static bool echoOk(float d) {
-  if (!(d >= 25.0f && d <= 450.0f)) return false;
-  if (!(cfg.emptyCm > cfg.fullCm + 2.0f)) return true;
+// Closer than 20 cm is treated as the probe ringing, not water.
+static bool echoOk(float d, bool calibrate) {
+  if (!(d >= 20.0f && d <= 450.0f)) return false;
+  if (calibrate || !(cfg.emptyCm > cfg.fullCm + 2.0f)) return true;
   float hi = cfg.emptyCm + 40.0f;
   if (hi > 450.0f) hi = 450.0f;
   float lo = cfg.fullCm - 5.0f;
-  if (lo < 25.0f) lo = 25.0f;
+  if (lo < 20.0f) lo = 20.0f;
   return d >= lo && d <= hi;
 }
 
@@ -565,26 +588,32 @@ static float pingCm() {
   delayMicroseconds(20);
   digitalWrite(PIN_TRIG, LOW);
   const unsigned long us = pulseIn(PIN_ECHO, HIGH, 25000UL);
-  if (us < 1400 || us > 24000) return NAN;
-  return us / 58.2f;
+  if (us < 200 || us > 30000) {
+    rawCm = NAN;
+    return NAN;
+  }
+  rawCm = us / 58.2f;
+  if (us < 1164 || us > 24000) return NAN;
+  return rawCm;
 }
 
 // Seven pings, 65 ms apart. Median, not the average. A mixed burst is dropped.
-static bool burstMedian(float* median, float* span) {
+// 0 = good median. 1 = no echo. 2 = the burst jumped.
+static int burstMedian(float* median, float* span, bool calibrate = false) {
   float raw[7];
   int n = 0;
   for (int i = 0; i < 7; i++) {
     const float d = pingCm();
-    if (echoOk(d)) raw[n++] = d;
+    if (echoOk(d, calibrate)) raw[n++] = d;
     if (i + 1 < 7) delay(65);
   }
-  if (n < 4) return false;
+  if (n < 4) return 1;
   sortFloats(raw, n);
   const float width = quantile(raw, n, 0.75f) - quantile(raw, n, 0.25f);
-  if (width > 8.0f) return false;
+  if (width > 8.0f) return 2;
   *median = quantile(raw, n, 0.5f);
   *span = width;
-  return true;
+  return 0;
 }
 
 // Three separate bursts must land within 1.5 cm. Used only by Calibrate.
@@ -592,7 +621,12 @@ static bool captureLevel(float* measured, char* err, size_t errN) {
   float shot[3];
   float span = 0;
   for (int i = 0; i < 3; i++) {
-    if (!burstMedian(&shot[i], &span) || span > 2.5f) {
+    const int rc = burstMedian(&shot[i], &span, true);
+    if (rc == 1) {
+      snprintf(err, errN, "No echo from the water. Check the sensor, then try again");
+      return false;
+    }
+    if (rc != 0 || span > 2.5f) {
       snprintf(err, errN, "Sensor is jumping. Keep the water still and try again");
       return false;
     }
@@ -610,7 +644,7 @@ static bool captureLevel(float* measured, char* err, size_t errN) {
 static void pushDistance(uint32_t now) {
   float sample = 0;
   float span = 0;
-  if (!burstMedian(&sample, &span)) {
+  if (burstMedian(&sample, &span) != 0) {
     if (lastAccept && now - lastAccept > 8000) {
       readingStable = false;
       tightSince = 0;
@@ -716,6 +750,11 @@ void loop() {
   server.handleClient();
   pollUdp();
   levelWet = levelIsWet(now);
+  static uint32_t lastTemp = 0;
+  if (lastTemp == 0 || now - lastTemp >= 2000) {
+    lastTemp = now;
+    sampleBoardTemp();
+  }
   if (now - lastSample >= 900) {
     lastSample = now;
     pushDistance(now);

@@ -4,6 +4,7 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <WebServer.h>
+#include <Update.h>
 #include <BLEDevice.h>
 #include <Wire.h>
 #include <Ethernet.h>
@@ -14,7 +15,7 @@
 #include "app_config.h"
 #include "ble_name.h"
 
-U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R2, U8X8_PIN_NONE);
 WebServer server(HTTP_PORT);
 EthernetUDP UdpEth;
 WiFiUDP UdpWifi;
@@ -30,7 +31,11 @@ static uint32_t dhcpStart = 0;
 static uint32_t dhcpTry = 0;
 static uint32_t staTry = 0;
 static uint32_t rebootAt = 0;
+static bool otaOk = false;
 static bool muted = false;
+static uint8_t buzzMode = 0;
+static uint8_t relayMode = 0;
+static uint8_t relayHigh = 1;
 static bool everConnected = false;
 static char ipBuf[16];
 static char modeIpBuf[16];
@@ -397,6 +402,12 @@ static String statusJson() {
   s += tank.level ? "1" : "0";
   s += ",\"muted\":";
   s += muted ? "1" : "0";
+  s += ",\"buzz\":";
+  s += buzzMode;
+  s += ",\"relay\":";
+  s += relayMode;
+  s += ",\"rlyh\":";
+  s += relayHigh ? "1" : "0";
   s += "}";
   return s;
 }
@@ -418,6 +429,8 @@ static void ethWrite(const String& body, const char* type, int code) {
   httpLen = 0;
 }
 
+static String alarmPage(const char* err);
+
 static void handleSave() {
   Field fields[40];
   memset(fields, 0, sizeof(fields));
@@ -429,8 +442,7 @@ static void handleSave() {
   }
   char err[80];
   if (!applyFields(cfg, false, fields, n, err, sizeof(err))) {
-    chosenIps();
-    server.send(400, "text/html", portalPage(false, cfg, ipBuf, modeIpBuf, err));
+    server.send(400, "text/html", alarmPage(err));
     return;
   }
   saveCfg(cfg);
@@ -502,16 +514,94 @@ static String wifiListJson(bool start) {
   return s;
 }
 
+static void handleUpdateFinish() {
+  if (!otaOk || Update.hasError()) {
+    Update.abort();
+    otaOk = false;
+    server.send(500, "text/plain", Update.errorString());
+    return;
+  }
+  server.send(200, "text/plain", "ok");
+  armReboot();
+}
+
+static void handleUpdateUpload() {
+  HTTPUpload& up = server.upload();
+  if (up.status == UPLOAD_FILE_START) {
+    otaOk = false;
+    Serial.printf("update %s\n", up.filename.c_str());
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+      Serial.printf("update begin %s\n", Update.errorString());
+      return;
+    }
+    otaOk = true;
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (!otaOk) return;
+    if (Update.write(up.buf, up.currentSize) != up.currentSize) {
+      otaOk = false;
+      Update.abort();
+    }
+  } else if (up.status == UPLOAD_FILE_END) {
+    if (!otaOk) return;
+    otaOk = Update.end(true);
+  } else if (up.status == UPLOAD_FILE_ABORTED) {
+    Update.abort();
+    otaOk = false;
+  }
+}
+
+static void loadRelayDrive() {
+  Preferences prefs;
+  if (!prefs.begin("cfg", true)) return;
+  relayHigh = prefs.getUChar("rlyh", 1) ? 1 : 0;
+  prefs.end();
+}
+
+static void saveRelayDrive() {
+  Preferences prefs;
+  if (!prefs.begin("cfg", false)) return;
+  prefs.putUChar("rlyh", relayHigh);
+  prefs.end();
+}
+
+static String alarmPage(const char* err) {
+  chosenIps();
+  return portalPage(false, cfg, ipBuf, modeIpBuf, err ? err : "", buzzMode, relayMode, relayHigh);
+}
+
+static void applyTest(const char* act) {
+  if (!act) return;
+  if (!strcmp(act, "buzzon")) buzzMode = 1;
+  else if (!strcmp(act, "buzzoff")) buzzMode = 2;
+  else if (!strcmp(act, "relayon")) relayMode = 1;
+  else if (!strcmp(act, "relayoff")) relayMode = 2;
+  else if (!strcmp(act, "rlyhigh")) {
+    relayHigh = 1;
+    saveRelayDrive();
+  } else if (!strcmp(act, "rlylow")) {
+    relayHigh = 0;
+    saveRelayDrive();
+  } else if (!strcmp(act, "auto")) {
+    buzzMode = 0;
+    relayMode = 0;
+  }
+}
+
 static void startHttp() {
   server.on("/", HTTP_GET, []() {
     chosenIps();
-    server.send(200, "text/html", portalPage(false, cfg, ipBuf, modeIpBuf, ""));
+    server.send(200, "text/html", alarmPage(""));
+  });
+  server.on("/test", HTTP_POST, []() {
+    applyTest(server.hasArg("act") ? server.arg("act").c_str() : "");
+    server.send(200, "text/html", alarmPage(""));
   });
   server.on("/api/status", HTTP_GET, []() { server.send(200, "application/json", statusJson()); });
   server.on("/api/wifi", HTTP_GET, []() {
     server.send(200, "application/json", wifiListJson(server.hasArg("start")));
   });
   server.on("/save", HTTP_POST, handleSave);
+  server.on("/update", HTTP_POST, handleUpdateFinish, handleUpdateUpload);
   server.on("/reset", HTTP_POST, []() {
     clearCfg();
     server.send(200, "text/html", "<p>Reset. Rebooting to the hotspot.</p>");
@@ -521,8 +611,139 @@ static void startHttp() {
   server.begin();
 }
 
+static bool ethOta = false;
+static bool ethOtaFile = false;
+static bool ethOtaOk = false;
+static int ethOtaLeft = 0;
+static char ethMark[80];
+static int ethMarkN = 0;
+static uint8_t ethHold[256];
+static int ethHoldN = 0;
+
+static int findBytes(const uint8_t* b, int n, const char* pat) {
+  int m = strlen(pat);
+  if (m <= 0 || n < m) return -1;
+  for (int i = 0; i + m <= n; i++) {
+    if (!memcmp(b + i, pat, m)) return i;
+  }
+  return -1;
+}
+
+static void ethOtaWrite(const uint8_t* p, int n) {
+  if (n <= 0 || !ethOtaOk) return;
+  if (Update.write(const_cast<uint8_t*>(p), n) != (size_t)n) ethOtaOk = false;
+}
+
+static void ethOtaFinish() {
+  int cut = findBytes(ethHold, ethHoldN, "\r\n--");
+  if (cut < 0) cut = ethHoldN;
+  ethOtaWrite(ethHold, cut);
+  const bool ok = ethOtaOk && Update.end(true);
+  ethOta = false;
+  ethOtaFile = false;
+  ethHoldN = 0;
+  if (!ok) {
+    Update.abort();
+    ethWrite(Update.errorString(), "text/plain", 500);
+    return;
+  }
+  ethWrite("ok", "text/plain", 200);
+  armReboot();
+}
+
+static void ethOtaPushFile(const uint8_t* data, int n) {
+  uint8_t mix[512];
+  if (ethHoldN + n > (int)sizeof(mix)) {
+    ethOtaOk = false;
+    return;
+  }
+  memcpy(mix, ethHold, ethHoldN);
+  memcpy(mix + ethHoldN, data, n);
+  int total = ethHoldN + n;
+  int keep = ethMarkN;
+  if (keep < 8) keep = 8;
+  if (keep > total) keep = total;
+  ethOtaWrite(mix, total - keep);
+  memcpy(ethHold, mix + total - keep, keep);
+  ethHoldN = keep;
+}
+
+static void ethOtaFeed(const uint8_t* data, int n) {
+  if (!ethOta || n < 0) return;
+  ethOtaLeft -= n;
+  int off = 0;
+  if (!ethOtaFile) {
+    while (off < n && ethHoldN < (int)sizeof(ethHold)) ethHold[ethHoldN++] = data[off++];
+    int at = findBytes(ethHold, ethHoldN, "\r\n\r\n");
+    if (at >= 0) {
+      ethOtaFile = true;
+      int start = at + 4;
+      int rest = ethHoldN - start;
+      ethHoldN = 0;
+      if (rest > 0) ethOtaPushFile(ethHold + start, rest);
+    } else if (ethHoldN >= (int)sizeof(ethHold)) {
+      ethOtaOk = false;
+    }
+    if (off < n && ethOtaFile) ethOtaPushFile(data + off, n - off);
+  } else {
+    ethOtaPushFile(data, n);
+  }
+  if (ethOtaLeft <= 0) ethOtaFinish();
+}
+
+static void serviceEthOta() {
+  if (!ethClient || !ethClient.connected()) {
+    if (ethOtaLeft > 0) {
+      Update.abort();
+      ethOta = false;
+      ethClient.stop();
+      httpLen = 0;
+    }
+    return;
+  }
+  uint8_t buf[256];
+  int got = 0;
+  while (ethClient.available() && got < (int)sizeof(buf)) buf[got++] = (uint8_t)ethClient.read();
+  if (got > 0) ethOtaFeed(buf, got);
+}
+
+static bool ethStartOta(const char* headers, const uint8_t* already, int alreadyN, int contentLength) {
+  const char* bpos = strstr(headers, "boundary=");
+  ethMarkN = 0;
+  ethMark[0] = 0;
+  if (bpos) {
+    bpos += 9;
+    if (*bpos == '"') bpos++;
+    int i = 0;
+    while (*bpos && *bpos != '"' && *bpos != ';' && *bpos != '\r' && i < 60) ethMark[i++] = *bpos++;
+    ethMark[i] = 0;
+    char tmp[80];
+    snprintf(tmp, sizeof(tmp), "\r\n--%s", ethMark);
+    strncpy(ethMark, tmp, sizeof(ethMark) - 1);
+    ethMark[sizeof(ethMark) - 1] = 0;
+    ethMarkN = strlen(ethMark);
+  }
+  ethOtaOk = Update.begin(UPDATE_SIZE_UNKNOWN);
+  ethOta = true;
+  ethOtaFile = bpos == nullptr;
+  ethOtaLeft = contentLength;
+  ethHoldN = 0;
+  if (!ethOtaOk) {
+    ethOta = false;
+    ethWrite(Update.errorString(), "text/plain", 500);
+    return false;
+  }
+  if (alreadyN > 0) ethOtaFeed(already, alreadyN);
+  else if (ethOtaLeft <= 0) ethOtaFinish();
+  return true;
+}
+
 static void serviceEthHttp() {
   if (!ethReady) return;
+  if (ethOta) {
+    serviceEthOta();
+    return;
+  }
   if (!ethClient || !ethClient.connected()) {
     EthernetClient next = ethHttp.available();
     if (!next) return;
@@ -540,25 +761,38 @@ static void serviceEthHttp() {
   const char* lenP = strstr(httpBuf, "Content-Length:");
   int need = 0;
   if (lenP && lenP < headEnd) need = atoi(lenP + 15);
+  char method[8] = {0};
+  char path[48] = {0};
+  sscanf(httpBuf, "%7s %47s", method, path);
+  char* query = strchr(path, '?');
+  if (query) *query = 0;
+  if (!strcmp(method, "POST") && !strcmp(path, "/update")) {
+    int have = httpLen - bodyAt;
+    if (have < 0) have = 0;
+    const uint8_t* body = reinterpret_cast<const uint8_t*>(httpBuf + bodyAt);
+    httpLen = 0;
+    ethStartOta(httpBuf, body, have, need);
+    return;
+  }
   if (need < 0 || bodyAt + need >= (int)sizeof(httpBuf)) {
     ethWrite("too big", "text/plain", 400);
     return;
   }
   if ((int)httpLen < bodyAt + need) return;
   httpBuf[bodyAt + need] = 0;
-  char method[8] = {0};
-  char path[48] = {0};
-  sscanf(httpBuf, "%7s %47s", method, path);
-  const bool startScan = strstr(path, "start=1") != nullptr;
-  char* query = strchr(path, '?');
-  if (query) *query = 0;
+  const bool startScan = strstr(httpBuf, "start=1") != nullptr;
   if (!strcmp(method, "GET") && !strcmp(path, "/")) {
     chosenIps();
-    ethWrite(portalPage(false, cfg, ipBuf, modeIpBuf, ""), "text/html", 200);
+    ethWrite(alarmPage(""), "text/html", 200);
   } else if (!strcmp(method, "GET") && !strcmp(path, "/api/status")) {
     ethWrite(statusJson(), "application/json", 200);
   } else if (!strcmp(method, "GET") && !strcmp(path, "/api/wifi")) {
     ethWrite(wifiListJson(startScan), "application/json", 200);
+  } else if (!strcmp(method, "POST") && !strcmp(path, "/test")) {
+    Field fields[8];
+    int n = parseForm(httpBuf + bodyAt, fields, 8);
+    applyTest(fieldGet(fields, n, "act"));
+    ethWrite(alarmPage(""), "text/html", 200);
   } else if (!strcmp(method, "POST") && !strcmp(path, "/reset")) {
     clearCfg();
     ethWrite("Reset. Rebooting.", "text/plain", 200);
@@ -569,7 +803,7 @@ static void serviceEthHttp() {
     char err[80];
     if (!applyFields(cfg, false, fields, n, err, sizeof(err))) {
       chosenIps();
-      ethWrite(portalPage(false, cfg, ipBuf, modeIpBuf, err), "text/html", 400);
+      ethWrite(alarmPage(err), "text/html", 400);
     } else {
       saveCfg(cfg);
       ethWrite("Saved. Rebooting.", "text/plain", 200);
@@ -664,13 +898,14 @@ void setup() {
   delay(200);
   cfgDefaults(remote);
   loadCfg(cfg);
+  loadRelayDrive();
   if (cfg.mode == MODE_AP) cfg.mode = MODE_NONE;
   pinMode(PIN_BUZZER, OUTPUT);
   pinMode(PIN_RELAY, OUTPUT);
   pinMode(PIN_MUTE, INPUT_PULLDOWN);
   pinMode(32, INPUT_PULLDOWN);
   digitalWrite(PIN_BUZZER, HIGH);
-  digitalWrite(PIN_RELAY, LOW);
+  digitalWrite(PIN_RELAY, relayHigh ? LOW : HIGH);
   Wire.begin(PIN_SDA, PIN_SCL);
   u8g2.begin();
   startRadio();
@@ -711,18 +946,24 @@ void loop() {
   static uint32_t downAt = 0;
   static uint32_t lastHigh = 0;
   const bool raw = digitalRead(PIN_MUTE) == HIGH || digitalRead(32) == HIGH;
-  if (raw) lastHigh = now;
-  if (raw && !held) {
-    held = true;
-    acted = false;
-    downAt = now;
+  if (raw) {
+    if (!held) {
+      held = true;
+      acted = false;
+      downAt = now;
+    }
+    lastHigh = now;
   }
-  if (held && !acted && now - downAt >= 2000 && now - lastHigh < 200) {
+  if (held && !acted && (uint32_t)(now - downAt) >= 2000 && (uint32_t)(now - lastHigh) < 500) {
     acted = true;
     muted = !muted;
+    if (muted) {
+      buzzMode = 0;
+      relayMode = 0;
+    }
     Serial.println(muted ? "mute" : "alarm reset");
   }
-  if (held && !raw && now - lastHigh >= 200) held = false;
+  if (held && (uint32_t)(now - lastHigh) >= 500) held = false;
   if (!tank.level && !isnan(tank.pct) && !isnan(prevPct) && prevPct >= remote.resetPct && tank.pct < remote.resetPct && muted) {
     muted = false;
     Serial.println("auto reset");
@@ -740,9 +981,16 @@ void loop() {
 
   bool busy = false;
   const bool tone = alarmSound(now, &busy);
-  const bool sound = linked && !muted && tone;
-  digitalWrite(PIN_BUZZER, sound ? LOW : HIGH);
-  digitalWrite(PIN_RELAY, (linked && !muted && zone >= 2) ? HIGH : LOW);
+  bool wantBuzz = linked && tone;
+  bool wantRelay = linked && zone >= 4;
+  if (buzzMode == 1) wantBuzz = true;
+  else if (buzzMode == 2 || muted) wantBuzz = false;
+  if (relayMode == 1) wantRelay = true;
+  else if (relayMode == 2 || muted) wantRelay = false;
+  const bool sound = wantBuzz;
+  digitalWrite(PIN_BUZZER, wantBuzz ? LOW : HIGH);
+  const bool relayLevel = relayHigh ? wantRelay : !wantRelay;
+  digitalWrite(PIN_RELAY, relayLevel ? HIGH : LOW);
 
   if (bootReset) {
     u8g2.clearBuffer();
@@ -755,7 +1003,9 @@ void loop() {
     shownSound = sound;
     lastUi = now;
     if (showTank) {
-      const bool borderOn = !(linked && !muted && busy) || sound;
+      const bool levelAlarm = tank.level && linked && !muted;
+      const bool borderOn = levelAlarm ? ((now / 400) % 2 == 0)
+                                       : (!(linked && !muted && busy) || sound);
       drawLive(tank.pct, tank.cm, borderOn);
     } else if (everConnected && !showTank) {
       drawDisconnected();
