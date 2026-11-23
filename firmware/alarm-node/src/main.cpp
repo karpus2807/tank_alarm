@@ -33,9 +33,18 @@ static uint32_t staTry = 0;
 static uint32_t rebootAt = 0;
 static bool otaOk = false;
 static bool muted = false;
+static uint8_t relayOut = 0;
 static uint8_t buzzMode = 0;
 static uint8_t relayMode = 0;
 static uint8_t relayHigh = 1;
+
+static void setMuted(bool on) {
+  muted = on;
+  if (muted) {
+    buzzMode = 0;
+    relayMode = 0;
+  }
+}
 static bool everConnected = false;
 static char ipBuf[16];
 static char modeIpBuf[16];
@@ -408,6 +417,8 @@ static String statusJson() {
   s += relayMode;
   s += ",\"rlyh\":";
   s += relayHigh ? "1" : "0";
+  s += ",\"out\":";
+  s += relayOut ? "1" : "0";
   s += "}";
   return s;
 }
@@ -569,6 +580,13 @@ static String alarmPage(const char* err) {
   return portalPage(false, cfg, ipBuf, modeIpBuf, err ? err : "", buzzMode, relayMode, relayHigh);
 }
 
+static void applyMute(const char* value) {
+  if (!value || !value[0]) return;
+  if (!strcmp(value, "1") || !strcmp(value, "mute")) setMuted(true);
+  else if (!strcmp(value, "0") || !strcmp(value, "unmute")) setMuted(false);
+  else if (!strcmp(value, "toggle")) setMuted(!muted);
+}
+
 static void applyTest(const char* act) {
   if (!act) return;
   if (!strcmp(act, "buzzon")) buzzMode = 1;
@@ -595,6 +613,10 @@ static void startHttp() {
   server.on("/test", HTTP_POST, []() {
     applyTest(server.hasArg("act") ? server.arg("act").c_str() : "");
     server.send(200, "text/html", alarmPage(""));
+  });
+  server.on("/mute", HTTP_POST, []() {
+    applyMute(server.hasArg("muted") ? server.arg("muted").c_str() : nullptr);
+    server.send(200, "application/json", statusJson());
   });
   server.on("/api/status", HTTP_GET, []() { server.send(200, "application/json", statusJson()); });
   server.on("/api/wifi", HTTP_GET, []() {
@@ -788,6 +810,11 @@ static void serviceEthHttp() {
     ethWrite(statusJson(), "application/json", 200);
   } else if (!strcmp(method, "GET") && !strcmp(path, "/api/wifi")) {
     ethWrite(wifiListJson(startScan), "application/json", 200);
+  } else if (!strcmp(method, "POST") && !strcmp(path, "/mute")) {
+    Field fields[4];
+    int n = parseForm(httpBuf + bodyAt, fields, 4);
+    applyMute(fieldGet(fields, n, "muted"));
+    ethWrite(statusJson(), "application/json", 200);
   } else if (!strcmp(method, "POST") && !strcmp(path, "/test")) {
     Field fields[8];
     int n = parseForm(httpBuf + bodyAt, fields, 8);
@@ -956,11 +983,7 @@ void loop() {
   }
   if (held && !acted && (uint32_t)(now - downAt) >= 2000 && (uint32_t)(now - lastHigh) < 500) {
     acted = true;
-    muted = !muted;
-    if (muted) {
-      buzzMode = 0;
-      relayMode = 0;
-    }
+    setMuted(!muted);
     Serial.println(muted ? "mute" : "alarm reset");
   }
   if (held && (uint32_t)(now - lastHigh) >= 500) held = false;
@@ -987,6 +1010,7 @@ void loop() {
   else if (buzzMode == 2 || muted) wantBuzz = false;
   if (relayMode == 1) wantRelay = true;
   else if (relayMode == 2 || muted) wantRelay = false;
+  relayOut = wantRelay ? 1 : 0;
   const bool sound = wantBuzz;
   digitalWrite(PIN_BUZZER, wantBuzz ? LOW : HIGH);
   const bool relayLevel = relayHigh ? wantRelay : !wantRelay;

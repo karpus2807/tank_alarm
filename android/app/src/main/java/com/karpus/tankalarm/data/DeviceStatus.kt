@@ -13,4 +13,9 @@ data class DeviceStatus(
     val muted: Int?,
     val link: Int?,
     val boardC: Double?,
+    val spread: Double? = null,
+    val buzz: Int? = null,
+    val relay: Int? = null,
+    val relayHigh: Int? = null,
+    val relayOut: Int? = null,
 )
